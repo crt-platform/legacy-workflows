@@ -24,6 +24,11 @@ on:
         required: false
         default: ''
         type: string
+      npm-tag:
+        description: 'npm dist-tag for publish. Use "dev" for prerelease publishes that skip versioning and git tagging.'
+        required: false
+        default: 'latest'
+        type: string
 
 concurrency:
   group: release-${{ github.repository }}-${{ github.ref_name }}
@@ -38,7 +43,7 @@ jobs:
   detect-and-release:
     if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip ci]') }}
     name: Release package
-    runs-on: microservicios
+    runs-on: ms
     outputs:
       released: ${{ steps.release.outputs.released }}
       new-version: ${{ steps.release.outputs.new-version }}
@@ -66,8 +71,23 @@ jobs:
           TAG_PREFIX: ${{ inputs.tag-prefix }}
           PACKAGE_DIR: ${{ inputs.package-dir }}
           FILTER_PATH: ${{ inputs.filter-path || inputs.package-dir }}
+          NPM_TAG: ${{ inputs.npm-tag || 'latest' }}
         run: |
           set -e
+
+          # ── Dev/prerelease shortcut: skip versioning and git tagging ──
+          if [ "$NPM_TAG" != "latest" ]; then
+            echo "Dev publish with --tag $NPM_TAG (no version bump, no git tag)"
+            CURRENT_VERSION=$(node -p "require('./${PACKAGE_DIR}/package.json').version" 2>/dev/null || echo "0.0.0")
+            cd "$PACKAGE_DIR"
+            npm install --ignore-scripts
+            npm run build
+            npm publish --tag "$NPM_TAG"
+            echo "released=true" >> "$GITHUB_OUTPUT"
+            echo "new-version=${CURRENT_VERSION}" >> "$GITHUB_OUTPUT"
+            echo "new-tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # ── 0. Configure git & pull latest (must run while tree is clean) ──
           git config user.name "github-actions[bot]"
@@ -158,7 +178,7 @@ jobs:
 
           # ── 8. Publish to npm registry ──
           cd "$PACKAGE_DIR"
-          npm publish
+          npm publish --tag "$NPM_TAG"
           cd "$GITHUB_WORKSPACE"
 
           echo "✅ Released ${NEW_TAG}"
@@ -170,7 +190,7 @@ jobs:
 
       # ── 10. Create GitHub Release (lightweight API call, single POST) ──
       - name: Create GitHub Release
-        if: steps.release.outputs.released == 'true'
+        if: steps.release.outputs.released == 'true' && inputs.npm-tag == 'latest'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.release.outputs.new-tag }}
