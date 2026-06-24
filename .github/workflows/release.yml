@@ -117,7 +117,7 @@ jobs:
         run: npx semantic-release
 
       - name: Get tag microservice
-        if: ${{ github.ref_name != 'dev' }}
+        if: ${{ env.IS_MICROSERVICE == 'true' }}
         run: echo TAG_VERSION=$(git tag -l | sort -V | grep -i '^[1-9]' | tail -n 1) >> $GITHUB_ENV
       
       - name: Build proyect
@@ -132,7 +132,7 @@ jobs:
         run: tar -czf dist.gz dist/*
 
       - name: Upload artifact main
-        if: ${{ github.ref_name != 'dev' && env.IS_MICROSERVICE == 'true' }}
+        if: ${{ env.IS_MICROSERVICE == 'true' }}
         uses: actions/upload-artifact@v6
         with:
           name: main-${{ env.TAG_VERSION }}
