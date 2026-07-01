@@ -132,10 +132,15 @@ jobs:
         run: tar -czf dist.gz dist/*
 
       - name: Upload artifact main
+        id: upload-artifact
         if: ${{ env.IS_MICROSERVICE == 'true' }}
         uses: actions/upload-artifact@v6
         with:
           name: main-${{ env.TAG_VERSION }}
           path: |
             dist.gz
+
+      - name: Log artifact ID
+        if: ${{ env.IS_MICROSERVICE == 'true' }}
+        run: echo "Artifact ID ${{ steps.upload-artifact.outputs.artifact-id }}"
       
