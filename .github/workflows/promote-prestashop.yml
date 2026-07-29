@@ -7,7 +7,7 @@
 #
 # Secrets: GH_TOKEN (org secret; repo scope on BOTH orgs AND the `workflow`
 # scope — the promoted commit contains a .github/workflows file).
-# Optional: SLACK_WEBHOOK_URL for result notifications.
+# Optional: SLACK_WEBHOOK_URL_PS for result notifications.
 name: Promote PrestaShop branch from ndcmsl
 run-name: "Promote ndcmsl:${{ inputs.source_branch }} → ${{ inputs.target_branch || inputs.source_branch }} (${{ inputs.requested_by || 'manual' }})"
 
@@ -100,9 +100,9 @@ jobs:
       - name: Notify Slack
         if: always()
         env:
-          HOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+          HOOK: ${{ secrets.SLACK_WEBHOOK_URL_PS }}
         run: |
-          [ -z "$HOOK" ] && { echo "no SLACK_WEBHOOK_URL — skipping"; exit 0; }
+          [ -z "$HOOK" ] && { echo "no SLACK_WEBHOOK_URL_PS — skipping"; exit 0; }
           if [ "${{ job.status }}" = "success" ]; then EMOJI="✅"; else EMOJI="❌"; fi
           curl -s -m 10 -X POST -H 'Content-Type: application/json' "$HOOK" -d "{
             \"text\": \"$EMOJI Promotion \`ndcmsl:${{ steps.v.outputs.src }}\` → \`crt-platform:${{ steps.v.outputs.tgt }}\` — ${{ job.status }} (${{ inputs.requested_by || 'manual' }}) — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true
