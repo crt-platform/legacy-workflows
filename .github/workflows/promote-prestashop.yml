@@ -1,0 +1,108 @@
+# Promotes a branch from ndcmsl/prestashop into crt-platform/prestashop,
+# attaching the canonical CI/CD pipeline (prestashop-deploy/ in THIS repo)
+# as one extra commit. Targeting dev1 auto-deploys to prestashop-dev1.
+#
+# Triggered by the /ps-promote Slack command (ps-promote Lambda in
+# create-shared -> workflow_dispatch) or manually from the Actions tab.
+#
+# Secrets: GH_TOKEN (org secret; repo scope on BOTH orgs AND the `workflow`
+# scope — the promoted commit contains a .github/workflows file).
+# Optional: SLACK_WEBHOOK_URL for result notifications.
+name: Promote PrestaShop branch from ndcmsl
+run-name: "Promote ndcmsl:${{ inputs.source_branch }} → ${{ inputs.target_branch || inputs.source_branch }} (${{ inputs.requested_by || 'manual' }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_branch:
+        description: "Branch in ndcmsl/prestashop to promote"
+        required: true
+        type: string
+      target_branch:
+        description: "Target branch in crt-platform/prestashop (default: same name; dev1 auto-deploys)"
+        required: false
+        type: string
+      requested_by:
+        description: "Audit: who asked (filled by the Slack bridge)"
+        required: false
+        type: string
+
+env:
+  UPSTREAM_REPO: ndcmsl/prestashop
+  TARGET_REPO: crt-platform/prestashop
+
+concurrency:
+  group: promote-prestashop
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ms
+    steps:
+      - name: Validate inputs (server-side guards)
+        id: v
+        run: |
+          SRC='${{ inputs.source_branch }}'
+          TGT='${{ inputs.target_branch }}'; TGT="${TGT:-$SRC}"
+          for b in "$SRC" "$TGT"; do
+            [[ "$b" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$ ]] || { echo "::error::invalid branch name: $b"; exit 1; }
+          done
+          case "$TGT" in master|main|dev|lab|develop)
+            echo "::error::target '$TGT' is protected — promotion refused"; exit 1;;
+          esac
+          echo "src=$SRC" >> "$GITHUB_OUTPUT"
+          echo "tgt=$TGT" >> "$GITHUB_OUTPUT"
+
+      # self — brings prestashop-deploy/ (the canonical pipeline files)
+      - uses: actions/checkout@v4
+
+      # the target repo, full history (we push the promoted branch's history)
+      - uses: actions/checkout@v4
+        with:
+          repository: crt-platform/prestashop
+          token: ${{ secrets.GH_TOKEN }}
+          path: ps
+          fetch-depth: 0
+
+      - name: Fetch source branch from upstream
+        working-directory: ps
+        run: |
+          git remote add upstream "https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/${UPSTREAM_REPO}.git"
+          git fetch upstream "refs/heads/${{ steps.v.outputs.src }}" \
+            || { echo "::error::branch '${{ steps.v.outputs.src }}' not found in ${UPSTREAM_REPO}"; exit 1; }
+          echo "UPSTREAM_SHA=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_ENV"
+
+      - name: Attach pipeline commit (from prestashop-deploy/)
+        working-directory: ps
+        run: |
+          git config user.name  "ps-promote-bot"
+          git config user.email "devops@create-store.com"
+          git checkout -B _promote FETCH_HEAD
+          rm -rf deploy
+          mkdir -p deploy .github/workflows
+          cp -a "$GITHUB_WORKSPACE/prestashop-deploy/deploy/." deploy/
+          cp "$GITHUB_WORKSPACE/prestashop-deploy/dev-deploy.yml" .github/workflows/dev-deploy.yml
+          git add -A deploy .github/workflows/dev-deploy.yml
+          git commit -m "ci: attach deploy pipeline (promoted from ndcmsl:${{ steps.v.outputs.src }}@${UPSTREAM_SHA:0:7}, requested by ${{ inputs.requested_by || 'manual' }})" \
+            || echo "pipeline files already identical — nothing to attach"
+
+      - name: Push to crt-platform as target branch (force-update)
+        working-directory: ps
+        run: |
+          git push origin "+_promote:refs/heads/${{ steps.v.outputs.tgt }}"
+          {
+            echo "### Promoted ✅"
+            echo "- source: \`${UPSTREAM_REPO}:${{ steps.v.outputs.src }}\` @ \`${UPSTREAM_SHA}\`"
+            echo "- target: \`${TARGET_REPO}:${{ steps.v.outputs.tgt }}\` (force-updated)"
+            echo "- pipeline source: \`legacy-workflows@${{ github.sha }}\` prestashop-deploy/"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify Slack
+        if: always()
+        env:
+          HOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          [ -z "$HOOK" ] && { echo "no SLACK_WEBHOOK_URL — skipping"; exit 0; }
+          if [ "${{ job.status }}" = "success" ]; then EMOJI="✅"; else EMOJI="❌"; fi
+          curl -s -m 10 -X POST -H 'Content-Type: application/json' "$HOOK" -d "{
+            \"text\": \"$EMOJI Promotion \`ndcmsl:${{ steps.v.outputs.src }}\` → \`crt-platform:${{ steps.v.outputs.tgt }}\` — ${{ job.status }} (${{ inputs.requested_by || 'manual' }}) — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" || true

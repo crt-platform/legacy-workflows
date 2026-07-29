@@ -1,0 +1,112 @@
+# Deploys a PrestaShop dev instance from its branch (branch name = target key
+# in deploy/targets.json: dev1 → prestashop-dev1, dev → web-01, …).
+# Requires: repo secret DEV_DEPLOY_SSH_KEY (private key; public half in
+# ec2-user's authorized_keys on each target) and the target box migrated to
+# the releases/ + shared/ layout (crt-agents/prestashop/new-instance-setup.md).
+name: Deploy PrestaShop (dev instances)
+
+on:
+  push:
+    branches: [dev1]          # add dev, dev2… as instances are migrated + enabled
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ms
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve target from deploy/targets.json
+        id: target
+        run: |
+          python3 - "$GITHUB_REF_NAME" <<'PY' >> "$GITHUB_OUTPUT"
+          import json, sys
+          branch = sys.argv[1]
+          targets = json.load(open("deploy/targets.json"))
+          t = targets.get(branch)
+          if not t:
+              sys.exit(f"branch '{branch}' has no entry in deploy/targets.json")
+          if not t.get("enabled"):
+              sys.exit(f"target '{t.get('name', branch)}' is DISABLED in targets.json (box not migrated?)")
+          print(f"host={t['host']}")
+          print(f"name={t['name']}")
+          print(f"header={t['host_header']}")
+          print(f"base={t['base']}")
+          PY
+
+      - name: SSH key + connectivity preflight
+        run: |
+          umask 077
+          echo "${{ secrets.DEV_DEPLOY_SSH_KEY }}" > "$RUNNER_TEMP/deploy_key"
+          ssh -i "$RUNNER_TEMP/deploy_key" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+            ec2-user@${{ steps.target.outputs.host }} 'echo "runner->target ssh OK: $(hostname)"'
+
+      - name: Compute release name
+        id: rel
+        run: echo "rel=$(date +%Y%m%d-%H%M%S)_${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Rsync release to target
+        run: |
+          rsync -az --info=stats2 \
+            -e "ssh -i $RUNNER_TEMP/deploy_key -o StrictHostKeyChecking=accept-new" \
+            --rsync-path="sudo rsync" \
+            --exclude ".git" \
+            ./ ec2-user@${{ steps.target.outputs.host }}:${{ steps.target.outputs.base }}/releases/${{ steps.rel.outputs.rel }}/
+
+      - name: Stage release (overlay layers)
+        run: |
+          ssh -i "$RUNNER_TEMP/deploy_key" ec2-user@${{ steps.target.outputs.host }} \
+            "sudo bash ${{ steps.target.outputs.base }}/releases/${{ steps.rel.outputs.rel }}/deploy/stage-release.sh '${{ steps.rel.outputs.rel }}'"
+
+      - name: Activate release (atomic symlink flip + graceful)
+        run: |
+          ssh -i "$RUNNER_TEMP/deploy_key" ec2-user@${{ steps.target.outputs.host }} \
+            "sudo bash ${{ steps.target.outputs.base }}/releases/${{ steps.rel.outputs.rel }}/deploy/activate-release.sh '${{ steps.rel.outputs.rel }}' '${{ steps.target.outputs.header }}'"
+
+      - name: Smoke tests (from runner, over the network)
+        run: |
+          H="${{ steps.target.outputs.host }}"; HDR="${{ steps.target.outputs.header }}"
+          fail=0
+          check() {
+            code=$(curl -sk -m 30 -o /dev/null -w '%{http_code}' -H "Host: $HDR" "https://$H$1")
+            echo "  $1 -> $code (want $2)"
+            [ "$code" = "$2" ] || fail=1
+          }
+          check "/es/" 200
+          check "/es/pedido-rapido?view=1" 200
+          check "/img/core/skl/promos/magazine/alejandra-pombo/2806-alejandra-pombo.json" 200
+          check "/area-12/" 401
+          check "/deploy/targets.json" 403
+          curl -sk -m 30 -H "Host: $HDR" "https://$H/es/" | grep -qi "<title>" || { echo "  no <title> in /es/"; fail=1; }
+          # definitive release-identity gate: the box must SERVE this exact release
+          body=$(curl -sk -m 30 -H "Cache-Control: no-cache" -H "Host: $HDR" "https://$H/RELEASE.txt")
+          echo "  RELEASE.txt: $(echo "$body" | head -1)"
+          echo "$body" | grep -q "${{ steps.rel.outputs.rel }}" || { echo "  RELEASE.txt does not match ${{ steps.rel.outputs.rel }}"; fail=1; }
+          exit $fail
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          PREV=$(ssh -i "$RUNNER_TEMP/deploy_key" ec2-user@${{ steps.target.outputs.host }} \
+            "cat ${{ steps.target.outputs.base }}/.previous-release" 2>/dev/null || true)
+          if [ -n "$PREV" ]; then
+            echo "Rolling back to: $PREV"
+            ssh -i "$RUNNER_TEMP/deploy_key" ec2-user@${{ steps.target.outputs.host }} \
+              "sudo bash ${{ steps.target.outputs.base }}/htdocs/deploy/activate-release.sh '$PREV' '${{ steps.target.outputs.header }}' || sudo bash ${{ steps.target.outputs.base }}/releases/$PREV/deploy/activate-release.sh '$PREV' '${{ steps.target.outputs.header }}' || true"
+          else
+            echo "No .previous-release recorded — manual intervention needed"
+          fi
+
+      - name: Prune old releases (keep 5 + permanent 000-baseline)
+        if: success()
+        run: |
+          ssh -i "$RUNNER_TEMP/deploy_key" ec2-user@${{ steps.target.outputs.host }} \
+            "cd ${{ steps.target.outputs.base }}/releases && ls -1dt */ | grep -v '^000-baseline/' | tail -n +6 | xargs -r sudo rm -rf --"
+
+      - name: Cleanup key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/deploy_key"

@@ -1,0 +1,17 @@
+{
+  "dev1": {
+    "enabled": true,
+    "name": "prestashop-dev1",
+    "host": "10.50.10.227",
+    "host_header": "prestashop-dev1.pvt.create-store.com",
+    "base": "/var/www/efectoled.com"
+  },
+  "dev": {
+    "enabled": false,
+    "_comment": "web-01 — DO NOT enable until the box is migrated to the releases/ layout (see crt-agents/prestashop dossier)",
+    "name": "web-01",
+    "host": "10.50.10.187",
+    "host_header": "prestashop.pvt.create-store.com",
+    "base": "/var/www/efectoled.com"
+  }
+}
