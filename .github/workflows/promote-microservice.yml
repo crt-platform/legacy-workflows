@@ -132,7 +132,16 @@ jobs:
           git config user.name  "ms-promote-bot"
           git config user.email "devops@create-store.com"
           git checkout -B _promote FETCH_HEAD
+          # The TARGET repo's default branch. semantic-release drops configured
+          # branches that do not exist on the remote, so a .releaserc carried
+          # over from ndcmsl naming `main` kills the release in a crt-platform
+          # repo that only has `master` (ERELEASEBRANCHES, hit on ecom.catalog
+          # 2026-07-31). migrate.py rebinds it to this.
+          DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's#^origin/##') || true
+          [ -n "$DEFAULT_BRANCH" ] || DEFAULT_BRANCH=$(git remote show origin 2>/dev/null | awk '/HEAD branch/ {print $NF}') || true
+          echo "target default branch: ${DEFAULT_BRANCH:-<unknown>}"
           python3 "$GITHUB_WORKSPACE/microservice-pipeline/migrate.py" "${{ steps.v.outputs.repo }}" \
+            ${DEFAULT_BRANCH:+--release-branch "$DEFAULT_BRANCH"} \
             | tee "$RUNNER_TEMP/migrate.log"
           git add -A
           git commit -m "ci: attach crt-platform pipeline (promoted from ${UPSTREAM_ORG}/${{ steps.v.outputs.repo }}:${{ steps.v.outputs.src }}@${UPSTREAM_SHA:0:7}, requested by ${{ inputs.requested_by || 'manual' }})" \

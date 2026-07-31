@@ -51,15 +51,44 @@ targeted patch and an already-correct file is left byte-identical.
 5. any repo-level `.npmrc` deleted (it overrides the runner/server global one
    with an unset `${NODE_AUTH_TOKEN}` → 401 on every private package; ms-01's
    warm cache hides it while ms-02 fails)
-6. `.releaserc` — a `dev` prerelease entry ensured. An **existing** dev entry is
-   left exactly as it is (`global.configuration` uses
-   `{"name":"dev","channel":"dev","prerelease":"dev"}` deliberately). Only the
-   `branches` key is touched — per-repo plugin config survives
-   (`global.carrier` has `npmPublish:false` plus custom git assets)
+6. `.releaserc` — a `dev` prerelease entry ensured, and any **release branch
+   that does not exist in the target repo is rebound to the repo's default
+   branch** (see below). An **existing** dev entry is left exactly as it is
+   (`global.configuration` uses `{"name":"dev","channel":"dev","prerelease":"dev"}`
+   deliberately). Only the `branches` key is touched — per-repo plugin config
+   survives (`global.carrier` has `npmPublish:false` plus custom git assets)
 7. `package_src/package.json` — published package name and github.com URLs →
    `@crt-platform`. **`@ndcmsl/*` dependencies are never touched** — those are
    real packages still served from ndcmsl GitHub Packages
 8. `CODEOWNERS` — `@ndcmsl/` → `@crt-platform/`
+
+### main vs master — the release-branch rebind
+
+The two orgs disagree about the release branch name, and the failure mode is
+opaque. `ndcmsl/ecom.catalog` releases from `main`; the crt-platform copy has
+only `master`. semantic-release resolves configured branches against the ones
+that actually exist on the remote and **silently drops the rest** — so carrying
+`"branches": "main"` over left only the `dev` prerelease entry, and since a
+prerelease channel needs a release branch to base its versioning on, the run
+died with:
+
+```
+ERELEASEBRANCHES The release branches are invalid in the `branches` configuration.
+Your configuration for the problematic branches is [].
+```
+
+(Hit for real on `ecom.catalog`, 2026-07-31. Note this predated promotion —
+`crt-platform/ecom.catalog:master` carried the same broken config, so any
+release from that repo would have failed the same way. `ndcmsl/global.content`
+has it too, so it was not a one-off.)
+
+So `migrate.py` takes `--release-branch <target default branch>`, which
+`promote-microservice.yml` derives from the checked-out target repo, and rebinds
+any non-existent release branch to it. A release branch that **does** exist is
+left byte-identical, and when git can't tell us the remote branches the check is
+skipped rather than guessed at. `repo-migration.md` lists "push a `main` branch"
+as a prerequisite; in practice every crt-platform service repo defaults to
+`master`, so rebinding is the reliable direction.
 
 **Deliberately left alone** (and reported): `crt-release-package.yml`,
 `lab-deploy.yml`, `release-ecs.yml`, `sync-main-to-develop.yml`,

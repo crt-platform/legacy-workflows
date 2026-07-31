@@ -6,6 +6,13 @@ Run from the root of a checked-out service repo:
 
     python3 migrate.py <repo-name>          # e.g. ecom.catalog
     python3 migrate.py <repo-name> --check  # report only, change nothing
+    python3 migrate.py <repo-name> --release-branch master
+
+`--release-branch` is the TARGET repo's default branch. Upstream and downstream
+disagree about main-vs-master (ndcmsl/ecom.catalog releases from `main`, the
+crt-platform copy only has `master`), and a .releaserc naming a branch that does
+not exist makes semantic-release die with ERELEASEBRANCHES. Pass it and the
+non-existent release branch is rebound; omit it and the value is left alone.
 
 This is the microservices counterpart of `prestashop-deploy/`. PrestaShop's
 promotion ATTACHES files that do not exist upstream, so a copy is enough. A
@@ -26,6 +33,7 @@ Exit codes: 0 ok · 3 refused (maverick SPA) · 4 assertion failed · 2 usage
 import json
 import os
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -79,6 +87,26 @@ class Result:
 
 def read(path):
     return path.read_text(encoding="utf-8")
+
+
+def remote_branches(root):
+    """Branch names that exist on the target repo's origin. Empty set when git
+    is unavailable or the checkout has no remote refs — callers must treat that
+    as 'unknown' and skip the check rather than assume nothing exists."""
+    try:
+        out = subprocess.run(
+            ["git", "for-each-ref", "--format=%(refname:short)", "refs/remotes/origin"],
+            cwd=root, capture_output=True, text=True, timeout=30,
+        )
+        if out.returncode != 0:
+            return set()
+        return {
+            line.split("/", 1)[1]
+            for line in out.stdout.split()
+            if line.startswith("origin/") and not line.endswith("/HEAD")
+        }
+    except (OSError, subprocess.SubprocessError):
+        return set()
 
 
 # --------------------------------------------------------------------------
@@ -275,7 +303,7 @@ def delete_files(root, res, check):
             res.note(f"deleted {rel}")
 
 
-def fix_releaserc(root, res, check):
+def fix_releaserc(root, res, check, release_branch):
     """Patch ONLY the `branches` key. `.releaserc` carries per-repo plugin
     config (global.carrier has npmPublish:false plus custom git assets) that a
     template overwrite would erase."""
@@ -293,17 +321,47 @@ def fix_releaserc(root, res, check):
     branches = data.get("branches", "master")
     if isinstance(branches, str):
         branches = [branches]
+
+    # A release branch that does not exist in the TARGET repo is fatal, and the
+    # failure is opaque. semantic-release resolves configured branches against
+    # the ones that actually exist on the remote and silently drops the rest;
+    # if that leaves only prerelease entries the run dies with
+    #   ERELEASEBRANCHES ... Your configuration for the problematic branches is []
+    # This is not hypothetical: ndcmsl/ecom.catalog releases from `main`, the
+    # crt-platform copy only has `master`, and promoting carried `main` over
+    # (2026-07-31). Upstream and downstream repos genuinely disagree about
+    # main-vs-master, so the incoming value cannot be trusted here.
+    existing = remote_branches(root)
+    if existing and release_branch and release_branch in existing:
+        rebound = []
+        for b in branches:
+            n = b.get("name") if isinstance(b, dict) else b
+            if n != "dev" and n not in existing:
+                res.note(f".releaserc: release branch '{n}' does not exist here "
+                         f"-> '{release_branch}' (repo default)")
+                b = {**b, "name": release_branch} if isinstance(b, dict) else release_branch
+            rebound.append(b)
+        branches = rebound
+
     names = [(b.get("name") if isinstance(b, dict) else b) for b in branches]
 
     # An existing `dev` entry is left EXACTLY as it is. global.configuration
     # carries {"name":"dev","channel":"dev","prerelease":"dev"} on purpose;
     # normalising it to prerelease:true would silently change its release
     # channel. We only guarantee that a dev entry exists at all.
+    data["branches"] = list(branches)
     if "dev" not in names:
         data["branches"] = list(branches) + [{"name": "dev", "prerelease": True}]
-    elif not isinstance(data.get("branches"), list):
-        data["branches"] = list(branches)
     data.setdefault("tagFormat", "${version}")
+
+    if existing and not [
+        (b.get("name") if isinstance(b, dict) else b)
+        for b in data["branches"]
+        if (isinstance(b, str) or not b.get("prerelease"))
+        and (b.get("name") if isinstance(b, dict) else b) in existing
+    ]:
+        res.warn("no release branch in .releaserc exists in this repo — "
+                 "semantic-release will fail with ERELEASEBRANCHES")
 
     if json.dumps(data, sort_keys=True) == before:
         return
@@ -388,8 +446,15 @@ def assert_clean(root, wf_dir, res):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    check = "--check" in sys.argv
+    argv = sys.argv[1:]
+    check = "--check" in argv
+    release_branch = None
+    if "--release-branch" in argv:
+        i = argv.index("--release-branch")
+        if i + 1 < len(argv):
+            release_branch = argv[i + 1]
+            argv = argv[:i] + argv[i + 2:]
+    args = [a for a in argv if not a.startswith("-")]
     if len(args) != 1:
         print(__doc__.strip(), file=sys.stderr)
         return 2
@@ -415,7 +480,7 @@ def main():
     fix_release_yml(wf_dir, res, check)
     fix_release_package_yml(wf_dir, repo, res, check, has_package_src)
     delete_files(root, res, check)
-    fix_releaserc(root, res, check)
+    fix_releaserc(root, res, check, release_branch)
     fix_package_src(root, repo, res, check)
     fix_codeowners(root, res, check)
 
