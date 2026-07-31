@@ -155,10 +155,19 @@ jobs:
             echo "Fix: NODE_AUTH_TOKEN=\$TOKEN npm install --package-lock-only --ignore-scripts, then commit."
             exit 1
           fi
-          if ! npm ci --dry-run; then
+          # --ignore-scripts is required, not optional: npm runs the repo's
+          # `prepare` hook even under --dry-run, and these repos use husky, which
+          # is not on the runner PATH -> `sh: 1: husky: not found`, exit 127.
+          # That is a lifecycle failure, not a dependency one, and it would fire
+          # on a fully-migrated repo too. We only want to know whether the lock
+          # resolves against the registry.
+          if ! npm ci --dry-run --ignore-scripts; then
             echo "::error::dependency validation failed — the promoted branch would not build."
-            echo "----- known package redirects (microservice-pipeline/redirects.json) -----"
-            cat "$GITHUB_WORKSPACE/microservice-pipeline/redirects.json"
+            # Package-redirect hints disabled by request (2026-07-31): several
+            # @ndcmsl packages have no crt-platform equivalent yet, so the table
+            # was noise rather than an actionable fix. Re-enable by uncommenting.
+            # echo "----- known package redirects (microservice-pipeline/redirects.json) -----"
+            # cat "$GITHUB_WORKSPACE/microservice-pipeline/redirects.json"
             exit 1
           fi
 

@@ -7,7 +7,14 @@
 | File | Role |
 |---|---|
 | `migrate.py` | the transform — encodes the 11 steps of `crt-agents/ci-cd/repo-migration.md` |
-| `redirects.json` | reference table printed when dependency validation fails |
+| `redirects.json` | reference table — **printing disabled 2026-07-31** (see below), kept as documentation |
+
+> **`redirects.json` is currently not surfaced.** The workflow used to dump it
+> when dependency validation failed; that was switched off by request because
+> several `@ndcmsl` packages still have no crt-platform equivalent, so the table
+> pointed at fixes that cannot be applied yet. The file remains the written
+> record of the mapping. Re-enable by uncommenting the two lines in the
+> `Validate dependencies` step of `promote-microservice.yml`.
 
 Edit the transform HERE; the next promotion carries the new version.
 
