@@ -1,0 +1,229 @@
+# Promotes a branch from ndcmsl/<service> into crt-platform/<service>,
+# transforming its pipeline files onto crt-platform/legacy-workflows as one
+# extra commit, then opening a PR into the repo's dev branch.
+#
+# Triggered by the /ryan Slack command (ms-promote Lambda in create-shared ->
+# workflow_dispatch) or manually from the Actions tab.
+#
+# This is the microservices sibling of promote-prestashop.yml, and it differs
+# in two ways that matter:
+#
+#   1. PrestaShop's payload is ADDITIVE (deploy/ + dev-deploy.yml don't exist
+#      upstream) so it is copied. A microservice branch already contains
+#      release.yml/.releaserc in their ndcmsl form, so the pipeline is
+#      TRANSFORMED in place by microservice-pipeline/migrate.py.
+#   2. PrestaShop's target branch IS an instance, so pushing deploys. Here a
+#      push only produces an artifact, and only from dev/master — deploying is
+#      Heimdall, by hand. So we never force-push dev (semantic-release commits
+#      back to it); we land on the target branch and open a PR.
+#
+# Secrets: GH_TOKEN (org secret; repo scope on BOTH orgs AND `workflow` scope —
+# the promoted commit contains .github/workflows files).
+# Optional: SLACK_WEBHOOK_URL_MS for result notifications.
+name: Promote microservice branch from ndcmsl
+run-name: "Promote ${{ inputs.repo }} — ndcmsl:${{ inputs.source_branch }} → crt-platform:${{ inputs.destination_branch }} (${{ inputs.requested_by || 'manual' }})"
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Microservice name, e.g. global.carrier (same name in both orgs)"
+        required: true
+        type: string
+      source_branch:
+        description: "Origin branch in ndcmsl/<repo>"
+        required: false
+        default: crt-dev
+        type: string
+      destination_branch:
+        description: "Branch in crt-platform/<repo> to force-update. `dev` => done (it is what builds the artifact); anything else => a PR into pr_base is opened as well"
+        required: false
+        default: dev
+        type: string
+      pr_base:
+        description: "Branch a non-dev destination raises its PR against"
+        required: false
+        default: dev
+        type: string
+      skip_validation:
+        description: "Skip the pre-push `npm ci --dry-run` gate (escape hatch)"
+        required: false
+        default: false
+        type: boolean
+      requested_by:
+        description: "Audit: who asked (filled by the Slack bridge)"
+        required: false
+        type: string
+
+env:
+  UPSTREAM_ORG: ndcmsl
+  TARGET_ORG: crt-platform
+
+concurrency:
+  group: promote-ms-${{ inputs.repo }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: ms
+    steps:
+      - name: Validate inputs and pick the push strategy
+        id: v
+        run: |
+          REPO='${{ inputs.repo }}'
+          SRC='${{ inputs.source_branch }}';       SRC="${SRC:-crt-dev}"
+          DEST='${{ inputs.destination_branch }}'; DEST="${DEST:-dev}"
+          BASE='${{ inputs.pr_base }}';            BASE="${BASE:-dev}"
+
+          # Service repos carry dots (ecom.catalog, search.etl-master).
+          [[ "$REPO" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,80}$ ]] \
+            || { echo "::error::invalid microservice name: $REPO"; exit 1; }
+          for b in "$SRC" "$DEST" "$BASE"; do
+            [[ "$b" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]{0,120}$ ]] \
+              || { echo "::error::invalid branch name: $b"; exit 1; }
+          done
+
+          # `dev` IS the intended force-push destination: migrate.py regenerates
+          # the crt-platform pipeline commits that make it diverge from upstream,
+          # and the npm ci --dry-run gate below stops the run before pushing if
+          # the branch lacks a lock file or still carries ndcmsl-flavoured deps.
+          # master/main/lab/develop are still refused — nothing in this flow is
+          # meant to rewrite a release or onprem-sync branch.
+          case "$DEST" in
+            master|main|lab|develop)
+              echo "::error::destination '$DEST' is refused — this flow force-updates its destination, and that branch is a release/sync branch. Use dev, or a review branch."; exit 1;;
+          esac
+
+          # dev is the artifact-producing branch, so landing there is the whole
+          # job. Any other destination additionally raises a PR toward it.
+          if [ "$DEST" = "$BASE" ]; then MODE=direct; else MODE=pr; fi
+
+          echo "repo=$REPO" >> "$GITHUB_OUTPUT"
+          echo "src=$SRC"   >> "$GITHUB_OUTPUT"
+          echo "dest=$DEST" >> "$GITHUB_OUTPUT"
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "::notice::${REPO}: ndcmsl:${SRC} -> crt-platform:${DEST} (force-update$([ "$MODE" = pr ] && echo " + PR into ${BASE}"))"
+
+      # self — brings microservice-pipeline/ (migrate.py + redirects.json)
+      - uses: actions/checkout@v4
+
+      # the target repo, full history (we push the promoted branch's history)
+      - name: Checkout crt-platform/${{ steps.v.outputs.repo }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.TARGET_ORG }}/${{ steps.v.outputs.repo }}
+          token: ${{ secrets.GH_TOKEN }}
+          path: svc
+          fetch-depth: 0
+
+      - name: Fetch source branch from upstream
+        working-directory: svc
+        run: |
+          git remote add upstream \
+            "https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/${UPSTREAM_ORG}/${{ steps.v.outputs.repo }}.git"
+          git fetch upstream "refs/heads/${{ steps.v.outputs.src }}" \
+            || { echo "::error::branch '${{ steps.v.outputs.src }}' not found in ${UPSTREAM_ORG}/${{ steps.v.outputs.repo }}"; exit 1; }
+          echo "UPSTREAM_SHA=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_ENV"
+
+      - name: Transform pipeline files (microservice-pipeline/migrate.py)
+        working-directory: svc
+        run: |
+          git config user.name  "ms-promote-bot"
+          git config user.email "devops@create-store.com"
+          git checkout -B _promote FETCH_HEAD
+          python3 "$GITHUB_WORKSPACE/microservice-pipeline/migrate.py" "${{ steps.v.outputs.repo }}" \
+            | tee "$RUNNER_TEMP/migrate.log"
+          git add -A
+          git commit -m "ci: attach crt-platform pipeline (promoted from ${UPSTREAM_ORG}/${{ steps.v.outputs.repo }}:${{ steps.v.outputs.src }}@${UPSTREAM_SHA:0:7}, requested by ${{ inputs.requested_by || 'manual' }})" \
+            || echo "pipeline already current — nothing to attach"
+
+      # Fails BEFORE anything is pushed. The lock/dependency layer is the one
+      # part of the migration that cannot be automated safely, so it is gated,
+      # not fixed: see microservice-pipeline/redirects.json.
+      - name: Validate dependencies (npm ci --dry-run, runner npm 10.9.8)
+        id: validate
+        if: ${{ !inputs.skip_validation }}
+        working-directory: svc
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GH_TOKEN }}
+          NPM_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          echo "npm $(npm -v) / node $(node -v)"
+          if [ ! -f package-lock.json ]; then
+            echo "::error::no package-lock.json on this branch — npm ci cannot run."
+            echo "Fix: NODE_AUTH_TOKEN=\$TOKEN npm install --package-lock-only --ignore-scripts, then commit."
+            exit 1
+          fi
+          if ! npm ci --dry-run; then
+            echo "::error::dependency validation failed — the promoted branch would not build."
+            echo "----- known package redirects (microservice-pipeline/redirects.json) -----"
+            cat "$GITHUB_WORKSPACE/microservice-pipeline/redirects.json"
+            exit 1
+          fi
+
+      - name: Push to crt-platform (force-update ${{ steps.v.outputs.dest }})
+        working-directory: svc
+        run: git push origin "+_promote:refs/heads/${{ steps.v.outputs.dest }}"
+
+      - name: Open PR into ${{ steps.v.outputs.base }}
+        id: pr
+        if: ${{ steps.v.outputs.mode == 'pr' }}
+        working-directory: svc
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: |
+          BASE='${{ steps.v.outputs.base }}'
+          if ! git ls-remote --exit-code --heads origin "$BASE" >/dev/null 2>&1; then
+            echo "::warning::PR base '$BASE' does not exist — the destination branch was pushed, no PR opened"
+            exit 0
+          fi
+          BODY=$(printf 'Promoted from `%s/%s:%s` @ `%s`.\n\nPipeline transformed by `microservice-pipeline/migrate.py` in legacy-workflows@%s:\n\n```\n%s\n```\n\nMerging this fires `release.yml` and produces the `x.y.z-dev.N` artifact Heimdall deploys.' \
+            "$UPSTREAM_ORG" "${{ steps.v.outputs.repo }}" "${{ steps.v.outputs.src }}" "$UPSTREAM_SHA" "${{ github.sha }}" "$(cat "$RUNNER_TEMP/migrate.log")")
+          PAYLOAD=$(python3 -c 'import json,os,sys; print(json.dumps({"title":sys.argv[1],"head":sys.argv[2],"base":sys.argv[3],"body":sys.argv[4]}))' \
+            "ci: promote ${{ steps.v.outputs.src }} from ndcmsl" \
+            "${{ steps.v.outputs.dest }}" "$BASE" "$BODY")
+          CODE=$(curl -s -o "$RUNNER_TEMP/pr.json" -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${TARGET_ORG}/${{ steps.v.outputs.repo }}/pulls" -d "$PAYLOAD")
+          if [ "$CODE" = "201" ]; then
+            URL=$(python3 -c 'import json;print(json.load(open("'"$RUNNER_TEMP"'/pr.json"))["html_url"])')
+            echo "pr_url=$URL" >> "$GITHUB_OUTPUT"
+            echo "opened $URL"
+          elif [ "$CODE" = "422" ]; then
+            echo "::notice::a PR for this head/base already exists (or there is nothing to compare) — branch was still pushed"
+          else
+            echo "::warning::PR creation returned HTTP $CODE — branch was still pushed"
+            cat "$RUNNER_TEMP/pr.json"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Promotion — ${{ steps.v.outputs.repo }}"
+            echo "- origin: \`${UPSTREAM_ORG}/${{ steps.v.outputs.repo }}:${{ steps.v.outputs.src }}\` @ \`${UPSTREAM_SHA}\`"
+            echo "- destination: \`${TARGET_ORG}/${{ steps.v.outputs.repo }}:${{ steps.v.outputs.dest }}\` (force-updated)"
+            echo "- PR: ${{ steps.pr.outputs.pr_url || 'n/a — destination is the artifact branch, nothing to raise' }}"
+            echo ""
+            echo "#### Pipeline transform"
+            echo '```'
+            cat "$RUNNER_TEMP/migrate.log" 2>/dev/null || echo "(did not run)"
+            echo '```'
+            echo "#### Once this reaches \`${{ steps.v.outputs.dest }}\` — promotion does NOT deploy"
+            echo "1. \`release.yml\` cuts \`x.y.z-dev.N\` and uploads artifact \`main-<version>\`."
+            echo "2. Config must be on ms-deploy **\`main\`**: \`${{ steps.v.outputs.repo }}/prod/crt_dev/app.settings.js\` (Heimdall fetches the DEFAULT branch, never \`dev\`)."
+            echo "3. Secret \`heimdall/${{ steps.v.outputs.repo }}/prod\` must exist."
+            echo "4. Deploy from Heimdall (mode PROD, infrastructure CRT_DEV), then re-apply any hot-patches."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify Slack
+        if: always()
+        env:
+          HOOK: ${{ secrets.SLACK_WEBHOOK_URL_MS }}
+        run: |
+          [ -z "$HOOK" ] && { echo "no SLACK_WEBHOOK_URL_MS — skipping"; exit 0; }
+          if [ "${{ job.status }}" = "success" ]; then EMOJI="✅"; else EMOJI="❌"; fi
+          PR='${{ steps.pr.outputs.pr_url }}'
+          curl -s -m 10 -X POST -H 'Content-Type: application/json' "$HOOK" -d "{
+            \"text\": \"$EMOJI Promotion \`${{ steps.v.outputs.repo }}\` \`ndcmsl:${{ steps.v.outputs.src }}\` → \`crt-platform:${{ steps.v.outputs.dest }}\` (${{ steps.v.outputs.mode }}) — ${{ job.status }} (${{ inputs.requested_by || 'manual' }})\n${PR:-${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}}\"}" || true
