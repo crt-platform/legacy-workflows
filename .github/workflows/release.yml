@@ -52,7 +52,15 @@ jobs:
           BEFORE="${{ github.event.before }}"
           AFTER="${{ github.sha }}"
 
-          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+          # `git cat-file -e` guard: on a FORCE-PUSH the previous tip becomes
+          # unreachable, so actions/checkout never fetches it, yet
+          # github.event.before still names it -> `fatal: bad object <sha>` and
+          # the whole release dies before it starts. The /ryan promotion
+          # force-pushes dev by design, so without this every promotion burns a
+          # run (seen on ecom.catalog 2026-07-31). Fall back to the head commit,
+          # which is the same path already used for a first push.
+          if [ -z "$BEFORE" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
             CHANGED_FILES=$(git show --pretty="" --name-only "$AFTER")
           else
             CHANGED_FILES=$(git diff --name-only "$BEFORE" "$AFTER")
