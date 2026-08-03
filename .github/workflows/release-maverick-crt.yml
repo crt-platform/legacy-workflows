@@ -1,0 +1,216 @@
+# Release + deploy a Maverick Angular SPA for crt-platform.
+#
+# Replaces release-maverick.yml for crt-platform repos. That one is ndcmsl-era:
+# `runs-on: microservicios` (no such runner here), and it gates BOTH the tag
+# resolution and the artifact upload behind `github.ref_name != 'dev'`, so a dev
+# branch produces no artifact at all. It has never executed once in crt-platform
+# — 0 runs across all 7 SPA repos.
+#
+# What this does differently:
+#   1. runs-on: ms
+#   2. dev branches produce artifacts (that is the whole point here)
+#   3. the artifact is named after the tag semantic-release ACTUALLY cut, not
+#      the highest tag in the repo (see "version" step)
+#   4. an optional deploy job pushes the built bundle to S3 + CloudFront
+#
+# The bundle is environment-portable: environment.prod.ts uses relative api
+# paths ("/api/maverick-logistic-bff/") with no hostnames, and --base-href is
+# path-based. So one artifact deploys to any environment serving the app at the
+# same path — build once, deploy many, roll back by redeploying an older one.
+#
+# Deploy credentials are OIDC (no long-lived keys): the IAM role lives in the
+# TARGET account, so the runner's own account is irrelevant and cross-account
+# works by pointing `aws-role-arn` at a different role per environment.
+name: Release + deploy Maverick SPA (crt)
+
+on:
+  workflow_call:
+    inputs:
+      deploy:
+        description: 'Sync the built bundle to S3 and invalidate CloudFront'
+        required: false
+        default: false
+        type: boolean
+      environment:
+        description: 'GitHub Environment holding the per-account deploy secrets'
+        required: false
+        default: ''
+        type: string
+      aws-region:
+        required: false
+        default: eu-south-2
+        type: string
+    secrets:
+      token:
+        required: true
+      aws-role-arn:
+        description: 'Role to assume in the TARGET account via OIDC'
+        required: false
+      spa-bucket:
+        required: false
+      cloudfront-distribution-id:
+        required: false
+    outputs:
+      version:
+        value: ${{ jobs.release.outputs.version }}
+      artifact:
+        value: ${{ jobs.release.outputs.artifact }}
+
+concurrency:
+  group: release-maverick-${{ github.repository }}-${{ github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  GH_TOKEN: ${{ secrets.token }}
+  NPM_TOKEN: ${{ secrets.token }}
+  NODE_AUTH_TOKEN: ${{ secrets.token }}
+
+jobs:
+  release:
+    name: Release
+    runs-on: ms
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      artifact: ${{ steps.version.outputs.artifact }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # semantic-release tracks release channels in git notes, and checkout ran
+      # with persist-credentials:false — this is also what gives the job push
+      # credentials for the tag and the chore(release) commit.
+      - name: Fetch semantic-release notes
+        run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git fetch origin +refs/notes/semantic-release:refs/notes/semantic-release || true
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Release
+        run: npx semantic-release
+
+      # The old workflow used `git tag -l | sort -V | tail -1`, i.e. the highest
+      # tag in the WHOLE repo — which is not necessarily the one just created.
+      # When no release is cut it silently names the artifact after an unrelated
+      # version; that is what masked the tag/tree mismatch in the
+      # global.third-party incident (2026-07-16). Read the tag on HEAD instead,
+      # and fall back to an honest branch-sha name so a dev push still yields a
+      # deployable, correctly-labelled artifact.
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION=$(git tag --points-at HEAD | grep -E '^[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+          if [ -n "$VERSION" ]; then
+            echo "semantic-release cut $VERSION"
+          else
+            VERSION="${GITHUB_REF_NAME//\//-}-${GITHUB_SHA:0:7}"
+            echo "no new release this run — labelling the build $VERSION"
+          fi
+          echo "version=$VERSION"        >> "$GITHUB_OUTPUT"
+          echo "artifact=main-$VERSION"  >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: npm run build
+
+      - name: Compress build
+        run: tar -czf dist.gz dist/*
+
+      - name: Upload artifact
+        id: upload-artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.version.outputs.artifact }}
+          path: dist.gz
+
+      - name: Log artifact ID
+        run: echo "Artifact ${{ steps.version.outputs.artifact }} id=${{ steps.upload-artifact.outputs.artifact-id }}"
+
+  deploy:
+    name: Deploy to S3
+    needs: release
+    if: ${{ inputs.deploy }}
+    runs-on: ms
+    # NO `environment:` here, deliberately. Declaring one CHANGES the OIDC
+    # subject claim from
+    #   repo:crt-platform/<repo>:ref:refs/heads/dev
+    # to
+    #   repo:crt-platform/<repo>:environment:<name>
+    # which would no longer match the role's trust condition, and the failure is
+    # an opaque "Not authorized to perform sts:AssumeRoleWithWebIdentity".
+    # To use GitHub Environments, switch github_allowed_refs in the roles layer
+    # to environment-scoped subjects FIRST, then add it back here.
+    permissions:
+      id-token: write     # required for OIDC; without it the role assume fails
+      contents: read
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.release.outputs.artifact }}
+
+      # The tar keeps the repo-relative layout (dist/<app>[/browser]). Angular 17+
+      # writes the browser bundle to <outputPath>/browser with server/prerender
+      # output alongside — only the browser bundle may be published, or server
+      # artifacts land in a public bucket and no index.html lands at the prefix.
+      - name: Extract and locate the bundle
+        id: bundle
+        run: |
+          mkdir -p _x && tar -xzf dist.gz -C _x
+          INDEX=$(find _x -name index.html -path '*/browser/*' | head -1)
+          [ -n "$INDEX" ] || INDEX=$(find _x -name index.html | head -1)
+          [ -n "$INDEX" ] || { echo "::error::no index.html in the artifact"; exit 1; }
+          DIST=$(dirname "$INDEX")
+
+          # The base href IS the deploy prefix — it is baked in at build time,
+          # so it is read back rather than assumed. A bundle built with the
+          # wrong --base-href loads its assets from the wrong path and comes up
+          # blank behind CloudFront with no server-side error.
+          HREF=$(sed -n 's/.*<base href="\([^"]*\)".*/\1/p' "$INDEX" | head -1)
+          PREFIX=$(sed -E 's#^/##; s#/$##' <<<"$HREF")
+          echo "bundle : $DIST"
+          echo "href   : $HREF -> prefix '${PREFIX:-<ROOT>}'"
+          echo "dist=$DIST"     >> "$GITHUB_OUTPUT"
+          echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.aws-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Sync to S3
+        env:
+          BUCKET: ${{ secrets.spa-bucket }}
+          PREFIX: ${{ steps.bundle.outputs.prefix }}
+          DIST: ${{ steps.bundle.outputs.dist }}
+        run: |
+          ARGS=(--delete)
+          if [ -z "$PREFIX" ]; then
+            # Root app (maverick-global builds with no --base-href). --delete at
+            # the bucket root would remove every sibling app's directory.
+            for s in logistic 3pl ecommerce marketplace customer-care; do
+              ARGS+=(--exclude "$s/*")
+            done
+            echo "root deploy — protecting sibling app prefixes"
+          fi
+          aws s3 sync "$DIST/" "s3://$BUCKET/${PREFIX:+$PREFIX/}" "${ARGS[@]}"
+
+      - name: Invalidate CloudFront
+        env:
+          DIST_ID: ${{ secrets.cloudfront-distribution-id }}
+          PREFIX: ${{ steps.bundle.outputs.prefix }}
+        run: |
+          INV=$(aws cloudfront create-invalidation \
+                  --distribution-id "$DIST_ID" \
+                  --paths "/${PREFIX:+$PREFIX/}*" \
+                  --query 'Invalidation.Id' --output text)
+          echo "invalidation $INV"
+          {
+            echo "### Deployed ${{ needs.release.outputs.version }}"
+            echo "- prefix: \`/${PREFIX:+$PREFIX/}\`"
+            echo "- invalidation: \`$INV\`"
+          } >> "$GITHUB_STEP_SUMMARY"
