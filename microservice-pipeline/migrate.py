@@ -88,6 +88,17 @@ MAVERICK_DEPLOY_SECRETS = {
     "cloudfront-distribution-id": "${{ secrets.CLOUDFRONT_DIST_BACKOFFICE_DEV }}",
 }
 
+# Required in the CALLER, not just in the reusable workflow. A called workflow's
+# permissions can only be equal to or more restrictive than its caller's, and
+# `id-token` defaults to `none` — so without this the deploy job cannot mint an
+# OIDC token no matter what it declares, and configure-aws-credentials fails.
+# This is exactly how the working OIDC caller (maverick-3pl's lab-deploy.yml)
+# is written.
+MAVERICK_PERMISSIONS = {
+    "contents": "read",
+    "id-token": "write",
+}
+
 NPM_TAG_VALUE = "${{ github.ref_name == 'dev' && 'dev' || 'latest' }}"
 
 # Deleted on migration.
@@ -272,6 +283,37 @@ def ensure_block_input(text, block, key, value):
 # --------------------------------------------------------------------------
 # Steps
 # --------------------------------------------------------------------------
+def ensure_top_level_permissions(text, perms):
+    """Ensure a workflow-level `permissions:` block carrying `perms`.
+
+    Top level, not job level: for a `uses:` job the caller's permissions bound
+    the reusable workflow's, so granting id-token inside the callee alone is not
+    enough."""
+    lines = text.split("\n")
+    changed = False
+
+    idx = next((i for i, l in enumerate(lines) if re.match(r"^permissions:\s*$", l)), None)
+    if idx is None:
+        jobs = next((i for i, l in enumerate(lines) if re.match(r"^jobs:\s*$", l)), None)
+        if jobs is None:
+            return text, False
+        block = ["permissions:"] + [f"  {k}: {v}" for k, v in perms.items()] + [""]
+        lines[jobs:jobs] = block
+        return "\n".join(lines), True
+
+    # Block exists — top up whatever is missing, leaving other keys alone.
+    end = idx + 1
+    while end < len(lines) and re.match(r"^\s+\S+\s*:", lines[end]):
+        end += 1
+    present = "\n".join(lines[idx + 1:end])
+    for key, value in perms.items():
+        if not re.search(r"^\s+" + re.escape(key) + r"\s*:", present, re.M):
+            lines.insert(end, f"  {key}: {value}")
+            end += 1
+            changed = True
+    return "\n".join(lines), changed
+
+
 def detect_flavour(wf_dir):
     """`maverick` for an Angular SPA, `microservice` otherwise.
 
@@ -322,6 +364,9 @@ def fix_release_yml(wf_dir, res, check, flavour):
         new, ch2 = ensure_with_input(new, "deploy", "true")
         if ch2:
             res.note("release.yml: added `deploy: true`")
+        new, chp = ensure_top_level_permissions(new, MAVERICK_PERMISSIONS)
+        if chp:
+            res.note("release.yml: added `permissions:` (id-token for OIDC)")
         for key, value in MAVERICK_DEPLOY_SECRETS.items():
             new, ch3 = ensure_block_input(new, "secrets", key, value)
             if ch3:

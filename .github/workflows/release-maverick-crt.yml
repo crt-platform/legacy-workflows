@@ -87,6 +87,36 @@ jobs:
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           git fetch origin +refs/notes/semantic-release:refs/notes/semantic-release || true
 
+      # Ported from release.yml (19af1d7, 2026-08-03) — SPAs are promoted by the
+      # same force-pushing /ryan, so they hit this identically.
+      #
+      # A promotion force-pushes this branch, orphaning its previous tip.
+      # Prerelease tags on the orphaned commits survive (tags are separate
+      # refs), so semantic-release cannot see them as prior releases yet
+      # recomputes the same version -> `fatal: tag '1.371.0-dev.1' already
+      # exists` (hit on maverick-logistic-bff 2026-08-03). Delete THIS branch's
+      # prerelease tags that are unreachable from HEAD, plus their GitHub
+      # Releases so the recreated tag can get a fresh one. Full release tags
+      # (x.y.z) never match the pattern, and neither do other branches'
+      # prerelease tags — so a master push can never delete live dev tags.
+      - name: Prune orphaned prerelease tags
+        run: |
+          git tag -l | grep -E "^[0-9]+\.[0-9]+\.[0-9]+-${{ github.ref_name }}\.[0-9]+$" | while read -r tag; do
+            git merge-base --is-ancestor "${tag}^{commit}" HEAD 2>/dev/null && continue
+            echo "Pruning orphaned prerelease tag: ${tag}"
+            RELEASE_ID=$(curl -sf -H "Authorization: Bearer ${GH_TOKEN}" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/tags/${tag}" \
+              | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])" 2>/dev/null || true)
+            if [ -n "$RELEASE_ID" ]; then
+              echo "  deleting GitHub Release id ${RELEASE_ID}"
+              curl -sf -X DELETE -H "Authorization: Bearer ${GH_TOKEN}" \
+                "https://api.github.com/repos/${{ github.repository }}/releases/${RELEASE_ID}" \
+                || echo "  WARN: could not delete GitHub Release ${RELEASE_ID}"
+            fi
+            git push origin ":refs/tags/${tag}"
+            git tag -d "${tag}"
+          done
+
       - name: Install dependencies
         run: npm ci
 
