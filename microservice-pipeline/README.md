@@ -104,11 +104,36 @@ as a prerequisite; in practice every crt-platform service repo defaults to
   dependency. Publishing a missing `@crt-platform/*` version is a human
   decision — see the `global-carrier` 0.3.3-vs-0.4.0 note in that file. Locks
   must be regenerated with the **system npm 10.9.8**, not npx npm@11.
-- **Maverick SPAs.** Refused (exit 3) when `release.yml` calls
-  `release-maverick.yml`. Those repos deploy through
-  `crt-platform/workflows/_angular-spa.yml` to S3+CloudFront and their legacy
-  `release.yml` shim has **never executed** in crt-platform. `maverick-*-bff`
-  repos are ordinary microservices and pass.
+- **Redirect a `pr-check.yml` that calls `release-maverick.yml`.**
+  `maverick-3pl` has one (a copy-paste slip upstream); pointing it at
+  `release-maverick-crt.yml` would make every pull request cut a release and
+  deploy. Left as-is and reported. Same for `pr-check-maverick.yml` — there is
+  no such workflow in legacy-workflows to redirect it to.
+
+## The two flavours
+
+Decided by what `release.yml` **calls**, not by the repo name — so
+`maverick-*-bff` repos, which are ordinary NestJS services, take the
+microservice path.
+
+| | microservice | maverick (Angular SPA) |
+|---|---|---|
+| reusable workflow | `release.yml` (+ `release-package.yml`) | `release-maverick-crt.yml` |
+| `with:` | `is-microservice: true` | `deploy: true` |
+| `secrets:` | `token` | `token` + `aws-role-arn`, `spa-bucket`, `cloudfront-distribution-id` |
+| output | `dist.gz` artifact → Heimdall, by hand | S3 sync + CloudFront invalidation, in the pipeline |
+
+The SPA path was **refused outright until 2026-08-04** — `release-maverick.yml`
+is ndcmsl-era (`runs-on: microservicios`, artifact gated off `dev`) and had
+never executed in crt-platform, so redirecting onto it would have resurrected a
+dead path. `release-maverick-crt.yml` fixes all of that and adds the deploy, so
+the redirect now points somewhere real.
+
+Deploy credentials are OIDC: the role lives in the **target** account
+(`crt-dev-github-deploy` in create-dev), scoped by the OIDC subject to
+`repo:crt-platform/maverick-*:ref:refs/heads/dev`. The secret names are
+hardcoded to the `_DEV` set in `MAVERICK_DEPLOY_SECRETS` — the only environment
+wired today.
 
 ## Usage
 
@@ -118,9 +143,9 @@ python3 migrate.py <repo-name> --check   # report only
 MIGRATE_ROOT=/path/to/repo python3 migrate.py <repo-name>
 ```
 
-Idempotent — a second run makes no changes. Exit codes: `0` ok, `3` refused
-(Maverick SPA), `4` assertion failed (an ndcmsl reference survived in a file
-this script owns), `2` usage.
+Idempotent — a second run makes no changes. Exit codes: `0` ok, `4` assertion
+failed (an ndcmsl reference survived in a file this script owns), `2` usage.
+`3` used to mean "refused: Maverick SPA" and is no longer emitted.
 
 ## Flow
 

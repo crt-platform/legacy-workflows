@@ -27,7 +27,17 @@ and files that are already correct are left byte-identical.
 Encodes the 11 steps of crt-agents/ci-cd/repo-migration.md. Idempotent: running
 it on an already-migrated branch makes no changes at all.
 
-Exit codes: 0 ok · 3 refused (maverick SPA) · 4 assertion failed · 2 usage
+Two flavours, decided by what release.yml CALLS rather than by repo name (so
+maverick-*-bff repos take the microservice path):
+
+  microservice — release.yml + release-package.yml on legacy-workflows,
+                 `is-microservice: true`, artifact consumed by Heimdall.
+  maverick     — an Angular SPA. release.yml is redirected onto
+                 release-maverick-crt.yml, gets `deploy: true` and the three
+                 AWS deploy secrets, and ships to S3 + CloudFront via OIDC.
+
+Exit codes: 0 ok · 4 assertion failed · 2 usage
+(3 was "refused: maverick SPA" and is no longer emitted — SPAs are supported.)
 """
 
 import json
@@ -41,12 +51,42 @@ from pathlib import Path
 # repo points at (crt-platform/workflows/_nestjs-ecs.yml, _angular-spa.yml,
 # _npm-package.yml, testing-central/…) belongs to the modern Docker/ECS
 # pipeline and is deliberately NOT touched.
-OWNED_WORKFLOWS = ("release", "release-package", "pr-check")
+# Reusable workflows we own in crt-platform/legacy-workflows, mapped
+# source-name -> target-name. Every entry but the maverick pair is an identity
+# mapping (same workflow, different org).
+#
+# Maverick SPAs are REDIRECTED onto release-maverick-crt.yml. The inherited
+# release-maverick.yml is ndcmsl-era — `runs-on: microservicios` (no such runner
+# here) and both the tag resolution and the artifact upload gated behind
+# `ref_name != 'dev'` — and it has never executed once in crt-platform.
+# release-maverick-crt.yml fixes all three and adds the S3/CloudFront deploy.
+OWNED_WORKFLOWS = {
+    "release": "release",
+    "release-package": "release-package",
+    "pr-check": "pr-check",
+    "release-maverick": "release-maverick-crt",
+    "release-maverick-crt": "release-maverick-crt",  # idempotency
+}
+
+# Longest first so `release-maverick-crt` wins over `release-maverick`, and
+# neither is shadowed by `release`. `pr-check-maverick.yml` can never match: the
+# pattern requires `.yml@` immediately after the name, and legacy-workflows has
+# no pr-check-maverick.yml to redirect it to.
+_OWNED_ALT = "|".join(sorted(OWNED_WORKFLOWS, key=len, reverse=True))
 
 USES_RE = re.compile(
     r"(uses:\s*)(?:ndcmsl|crt-platform)/(?:workflows|legacy-workflows)"
-    r"/\.github/workflows/(" + "|".join(OWNED_WORKFLOWS) + r")\.yml@[A-Za-z0-9._/-]+"
+    r"/\.github/workflows/(" + _OWNED_ALT + r")\.yml@[A-Za-z0-9._/-]+"
 )
+
+# Passed by the caller into release-maverick-crt.yml so the deploy job can
+# assume the create-dev OIDC role. Names match the existing `_LAB` org-secret
+# convention; only the create-dev set exists today.
+MAVERICK_DEPLOY_SECRETS = {
+    "aws-role-arn": "${{ secrets.AWS_ROLE_ARN_DEV }}",
+    "spa-bucket": "${{ secrets.SPA_BUCKET_BACKOFFICE_DEV }}",
+    "cloudfront-distribution-id": "${{ secrets.CLOUDFRONT_DIST_BACKOFFICE_DEV }}",
+}
 
 NPM_TAG_VALUE = "${{ github.ref_name == 'dev' && 'dev' || 'latest' }}"
 
@@ -175,32 +215,37 @@ def _indent_step(lines):
 
 
 def ensure_with_input(text, key, value):
-    """Ensure `key: value` exists inside the first `with:` mapping, creating the
-    `with:` block if the step has none.
+    return ensure_block_input(text, "with", key, value)
+
+
+def ensure_block_input(text, block, key, value):
+    """Ensure `key: value` exists inside the first `<block>:` mapping (`with` or
+    `secrets`), creating the block right after the `uses:` line if absent.
 
     Real ndcmsl branches often have no `with:` at all — global.content's
     feat/MS-1421 calls the reusable workflow with only `secrets:`. Missing
     `is-microservice: true` is silent and expensive: the reusable release.yml
     gates tag resolution, compression AND artifact upload on it, so the branch
-    builds green and produces nothing for Heimdall to deploy."""
+    builds green and produces nothing for Heimdall to deploy. The maverick
+    flavour needs the same treatment for three deploy secrets."""
     if re.search(r"^\s*" + re.escape(key) + r"\s*:", text, re.M):
         return text, False
     lines = text.split("\n")
 
-    if not any(re.match(r"^(\s*)with:\s*$", ln) for ln in lines):
+    if not any(re.match(r"^(\s*)" + block + r":\s*$", ln) for ln in lines):
         for i, line in enumerate(lines):
             m = re.match(r"^(\s*)uses:\s*crt-platform/legacy-workflows/", line)
             if not m:
                 continue
             base = m.group(1)
             step = _indent_step(lines)
-            lines.insert(i + 1, f"{base}with:")
+            lines.insert(i + 1, f"{base}{block}:")
             lines.insert(i + 2, f"{base}{' ' * step}{key}: {value}")
             return "\n".join(lines), True
         return text, False
 
     for i, line in enumerate(lines):
-        m = re.match(r"^(\s*)with:\s*$", line)
+        m = re.match(r"^(\s*)" + block + r":\s*$", line)
         if not m:
             continue
         base = m.group(1)
@@ -227,32 +272,41 @@ def ensure_with_input(text, key, value):
 # --------------------------------------------------------------------------
 # Steps
 # --------------------------------------------------------------------------
-def guard_maverick(wf_dir):
-    """Maverick SPAs are not on this pipeline. Their `release.yml` shim calls
-    release-maverick.yml and has never once executed in crt-platform (0 runs in
-    all 7 SPA repos); they deploy via crt-platform/workflows/_angular-spa.yml to
-    S3+CloudFront. Rewriting the shim would resurrect a dead path on the `ms`
-    runner. The maverick-*-bff repos are ordinary microservices and pass."""
-    for name in ("release.yml", "pr-check.yml"):
-        f = wf_dir / name
-        if f.is_file() and "release-maverick.yml" in read(f):
-            return f"{name} calls release-maverick.yml — this is a Maverick SPA"
-    return None
+def detect_flavour(wf_dir):
+    """`maverick` for an Angular SPA, `microservice` otherwise.
+
+    Decided from what release.yml CALLS, not from the repo name: maverick-*-bff
+    repos are ordinary NestJS microservices and must take the normal path."""
+    f = wf_dir / "release.yml"
+    if f.is_file() and re.search(r"release-maverick(-crt)?\.yml@", read(f)):
+        return "maverick"
+    return "microservice"
 
 
 def fix_workflow_uses(wf_dir, res, check):
     for f in sorted(wf_dir.glob("*.y*ml")):
-        text = new = read(f)
-        new = USES_RE.sub(
-            r"\1crt-platform/legacy-workflows/.github/workflows/\2.yml@main", new
-        )
+        text = read(f)
+
+        def repl(m, _name=f.name):
+            src = m.group(2)
+            tgt = OWNED_WORKFLOWS[src]
+            # A rename is a REDIRECT onto a different workflow, so it only
+            # applies to release.yml. maverick-3pl's pr-check.yml also calls
+            # release-maverick.yml (a copy-paste slip upstream) — redirecting
+            # that would make every pull request cut a release AND deploy.
+            if tgt != src and _name != "release.yml":
+                return m.group(0)
+            return (f"{m.group(1)}crt-platform/legacy-workflows"
+                    f"/.github/workflows/{tgt}.yml@main")
+
+        new = USES_RE.sub(repl, text)
         if new != text:
             if not check:
                 f.write_text(new, encoding="utf-8")
             res.note(f"{f.name}: uses -> crt-platform/legacy-workflows@main")
 
 
-def fix_release_yml(wf_dir, res, check):
+def fix_release_yml(wf_dir, res, check, flavour):
     f = wf_dir / "release.yml"
     if not f.is_file():
         res.warn("no .github/workflows/release.yml — nothing will build")
@@ -261,10 +315,25 @@ def fix_release_yml(wf_dir, res, check):
     new, ch = ensure_list_entry(new, "branches", "dev")
     if ch:
         res.note("release.yml: added `dev` to push branches")
-    if "is-microservice" not in new:
-        new, ch2 = ensure_with_input(new, "is-microservice", "true")
+
+    if flavour == "maverick":
+        # release-maverick-crt.yml defaults deploy to false so adopting it can
+        # never ship by accident — the caller has to opt in.
+        new, ch2 = ensure_with_input(new, "deploy", "true")
         if ch2:
-            res.note("release.yml: added `is-microservice: true`")
+            res.note("release.yml: added `deploy: true`")
+        for key, value in MAVERICK_DEPLOY_SECRETS.items():
+            new, ch3 = ensure_block_input(new, "secrets", key, value)
+            if ch3:
+                res.note(f"release.yml: added secret `{key}`")
+    else:
+        # No `is-microservice` input exists on release-maverick-crt.yml, and its
+        # artifact upload is not gated on one.
+        if "is-microservice" not in new:
+            new, ch2 = ensure_with_input(new, "is-microservice", "true")
+            if ch2:
+                res.note("release.yml: added `is-microservice: true`")
+
     if new != text and not check:
         f.write_text(new, encoding="utf-8")
 
@@ -425,15 +494,24 @@ def fix_codeowners(root, res, check):
             res.note(f"{rel}: @ndcmsl/ -> @crt-platform/")
 
 
-def assert_clean(root, wf_dir, res):
+def assert_clean(root, wf_dir, res, flavour="microservice"):
     """Fail on leftovers in the files we own; report the rest. Files belonging
     to the modern pipeline (lab-deploy.yml, release-ecs.yml, crt-release-*) and
     .github/prompts/ docs are someone else's business."""
     failures = []
     for f in sorted(wf_dir.glob("*.y*ml")):
-        if "ndcmsl" not in read(f):
+        text = read(f)
+        if "ndcmsl" not in text:
             continue
-        if f.name in MUST_BE_CLEAN:
+        # Deliberately not rewritten (see fix_workflow_uses): a pr-check that
+        # calls release-maverick.yml must not be redirected onto a workflow that
+        # releases and deploys. Report it instead of failing the promotion.
+        deliberate = (
+            flavour == "maverick"
+            and f.name != "release.yml"
+            and re.search(r"(release|pr-check)-maverick\.yml@", text)
+        )
+        if f.name in MUST_BE_CLEAN and not deliberate:
             failures.append(f".github/workflows/{f.name}")
         else:
             res.warn(f"{f.name} still references ndcmsl (not ours — left as is)")
@@ -467,17 +545,12 @@ def main():
         print(f"::error::{root} has no .github/workflows — not a pipeline repo")
         return 4
 
-    refusal = guard_maverick(wf_dir)
-    if refusal:
-        print(f"::error::refused: {refusal}. Maverick SPAs deploy via "
-              f"crt-platform/workflows/_angular-spa.yml (S3+CloudFront), not this "
-              f"pipeline. maverick-*-bff repos are fine — those are microservices.")
-        return 3
+    flavour = detect_flavour(wf_dir)
 
     has_package_src = (root / "package_src").is_dir()
 
     fix_workflow_uses(wf_dir, res, check)
-    fix_release_yml(wf_dir, res, check)
+    fix_release_yml(wf_dir, res, check, flavour)
     fix_release_package_yml(wf_dir, repo, res, check, has_package_src)
     delete_files(root, res, check)
     fix_releaserc(root, res, check, release_branch)
@@ -486,9 +559,9 @@ def main():
 
     # Run the assertion BEFORE reporting — it raises warnings of its own
     # (leftover ndcmsl references in files we deliberately do not own).
-    failures = [] if check else assert_clean(root, wf_dir, res)
+    failures = [] if check else assert_clean(root, wf_dir, res, flavour)
 
-    print(f"--- migrate.py {repo} ({'check' if check else 'apply'}) ---")
+    print(f"--- migrate.py {repo} ({flavour}, {'check' if check else 'apply'}) ---")
     if res.changed:
         for c in res.changed:
             print(f"  changed: {c}")
