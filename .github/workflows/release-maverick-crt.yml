@@ -163,7 +163,16 @@ jobs:
     name: Deploy to S3
     needs: release
     if: ${{ inputs.deploy }}
-    runs-on: ms
+    # GitHub-hosted, NOT the `ms` runner. This job needs nothing from the
+    # private network — the artifact comes from GitHub and S3/CloudFront are
+    # public endpoints — while `ms` sits in a private subnet in create-shared
+    # and could not reach STS: configure-aws-credentials hung on "Assuming role
+    # with OIDC" for 4m+ before timing out (2026-08-04). A trust-policy problem
+    # fails instantly with AccessDenied, so a hang is always reachability.
+    # This also matches _angular-spa.yml, the OIDC deploy that already works.
+    # The release job stays on `ms` — it needs the runner's global ~/.npmrc for
+    # the private @ndcmsl packages.
+    runs-on: ubuntu-latest
     # NO `environment:` here, deliberately. Declaring one CHANGES the OIDC
     # subject claim from
     #   repo:crt-platform/<repo>:ref:refs/heads/dev
