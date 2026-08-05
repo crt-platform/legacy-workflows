@@ -14,6 +14,13 @@ concurrency:
   group: deploy-${{ github.ref_name }}
   cancel-in-progress: false
 
+env:
+  # How many real releases to retain on the target after a successful deploy.
+  # 000-baseline is permanent and is NOT counted. The currently-active release and
+  # the .previous-release rollback target are never pruned even if they fall outside
+  # this window. Change the number here — retention is entirely workflow-side.
+  RELEASES_TO_KEEP: "3"
+
 jobs:
   deploy:
     runs-on: ms
@@ -101,11 +108,62 @@ jobs:
             echo "No .previous-release recorded — manual intervention needed"
           fi
 
-      - name: Prune old releases (keep 5 + permanent 000-baseline)
+      # Retention lives here, in the workflow — no server-side cron or config.
+      # RELEASES_TO_KEEP counts real releases only; 000-baseline is permanent and
+      # is never counted or considered.
+      - name: Prune old releases (keep last ${{ env.RELEASES_TO_KEEP }}; 000-baseline is permanent)
         if: success()
         run: |
           ssh -i "$RUNNER_TEMP/deploy_key" ec2-user@${{ steps.target.outputs.host }} \
-            "cd ${{ steps.target.outputs.base }}/releases && ls -1dt */ | grep -v '^000-baseline/' | tail -n +6 | xargs -r sudo rm -rf --"
+            "sudo bash -s -- '${{ steps.target.outputs.base }}' '${{ env.RELEASES_TO_KEEP }}'" <<'REMOTE'
+          set -euo pipefail
+          BASE="$1"; KEEP="$2"
+          cd "$BASE/releases"
+
+          ACTIVE="$(basename "$(readlink -f "$BASE/htdocs")")"
+          PREV="$(cat "$BASE/.previous-release" 2>/dev/null || true)"
+
+          # Consider ONLY real release directories, named <YYYYMMDD>-<HHMMSS>_<sha>:
+          #  * -type d skips the 'releases/monolog' symlink. This is load-bearing: the
+          #    previous version of this step fed 'monolog/' to `rm -rf`, and a trailing
+          #    slash makes rm follow the link and delete the CONTENTS of the shared
+          #    $BASE/monolog dir — the Gotcha-B shim that DG_LOG_SQL_ERROR_FILE_NAME
+          #    writes into. It was one deploy away from firing on dev1 and dev2.
+          #  * the name pattern also excludes 000-baseline, which is permanent.
+          # Sort newest-first by NAME: the timestamp prefix makes lexical order
+          # chronological and deterministic, unlike `ls -t` mtimes which shift when
+          # files inside a release are touched.
+          releases=()
+          while IFS= read -r r; do releases+=("$r"); done < <(
+            find . -maxdepth 1 -type d -regextype posix-extended \
+                 -regex '\./[0-9]{8}-[0-9]{6}_.+' -printf '%f\n' | sort -r
+          )
+
+          keep=(); drop=()
+          for r in "${releases[@]}"; do
+            if [ "${#keep[@]}" -lt "$KEEP" ]; then
+              keep+=("$r")
+            elif [ "$r" = "$ACTIVE" ] || [ "$r" = "$PREV" ]; then
+              keep+=("$r")   # safety net: never prune what is live or the rollback target
+            else
+              drop+=("$r")
+            fi
+          done
+
+          echo "prune: keep=$KEEP active=$ACTIVE previous=${PREV:-none} found=${#releases[@]} release(s)"
+          for r in "${keep[@]}"; do
+            extra=""
+            [ "$r" = "$ACTIVE" ] && extra=" (active)"
+            [ "$r" = "$PREV" ]   && extra="$extra (rollback target)"
+            echo "  KEEP   $r$extra"
+          done
+          if [ "${#drop[@]}" -eq 0 ]; then
+            echo "  nothing to delete"
+          else
+            for r in "${drop[@]}"; do echo "  DELETE $r"; done
+            rm -rf -- "${drop[@]}"        # no trailing slashes; -- guards odd names
+          fi
+          REMOTE
 
       - name: Cleanup key
         if: always()
