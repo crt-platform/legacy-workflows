@@ -6,6 +6,30 @@
     "host_header": "prestashop-dev1.pvt.create-store.com",
     "base": "/var/www/efectoled.com"
   },
+  "dev2": {
+    "enabled": true,
+    "_comment": "provisioned by the prestashop terraform layer (fleet AMI clone of dev1)",
+    "name": "prestashop-dev2",
+    "host": "10.50.10.228",
+    "host_header": "prestashop-dev2.pvt.create-store.com",
+    "base": "/var/www/efectoled.com"
+  },
+  "dev3": {
+    "enabled": false,
+    "_comment": "instance created desired_state=stopped — flip enabled when the box is started",
+    "name": "prestashop-dev3",
+    "host": "10.50.10.229",
+    "host_header": "prestashop-dev3.pvt.create-store.com",
+    "base": "/var/www/efectoled.com"
+  },
+  "dev4": {
+    "enabled": false,
+    "_comment": "instance created desired_state=stopped — flip enabled when the box is started",
+    "name": "prestashop-dev4",
+    "host": "10.50.10.230",
+    "host_header": "prestashop-dev4.pvt.create-store.com",
+    "base": "/var/www/efectoled.com"
+  },
   "dev": {
     "enabled": false,
     "_comment": "web-01 — DO NOT enable until the box is migrated to the releases/ layout (see crt-agents/prestashop dossier)",
