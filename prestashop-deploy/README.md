@@ -1,3 +1,10 @@
+> ⚠️ **`stage-release.sh` deliberately rewrites some application code at deploy time**
+> (Layer 4). Fixes that exist only in `crt-platform` are reverted by every `/yuta`
+> promotion, so the deploy re-applies them. For those files, what runs on the box is
+> intentionally **not** what is in the branch — see
+> [`ENVIRONMENT-PATCHES.md`](./ENVIRONMENT-PATCHES.md) before debugging any
+> "the repo says X but the server does Y" discrepancy.
+
 # prestashop-deploy — canonical PrestaShop dev-deploy pipeline
 
 **This folder is the source of truth** for the files that
