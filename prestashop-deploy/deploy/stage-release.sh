@@ -8,7 +8,9 @@
 #
 # Layer 1  instance config copied from the CURRENTLY ACTIVE release
 # Layer 2  catch-all sweep of untracked runtime files from the active release
-# Layer 3  shared/ symlinks + runtime dirs + ownership + sanity gate
+# Layer 3  shared/ symlinks + runtime dirs + ownership
+# Layer 4  environment patches — downstream-only fixes that promotion reverts
+#          (see ENVIRONMENT-PATCHES.md) + sanity gate
 set -euo pipefail
 
 REL="${1:?usage: stage-release.sh <release-name>}"
@@ -59,6 +61,74 @@ rm -f "$NEW/cache/class_index.php"
 # sibling-escape shim (DB config DG_LOG_SQL_ERROR_FILE_NAME → ../monolog/…)
 [ -L "$BASE/releases/monolog" ] || ln -s ../monolog "$BASE/releases/monolog"
 chown -R apache:apache "$NEW"
+
+echo "== Layer 4: environment patches (see ENVIRONMENT-PATCHES.md)"
+# Fixes that exist ONLY downstream in crt-platform and are absent from ndcmsl.
+# /yuta force-pushes ndcmsl content over crt-platform:devN, so every promotion
+# reverts them. Until they are upstreamed, the deploy re-applies them here — the
+# last common chokepoint before code goes live (it also covers plain pushes to a
+# dev branch, which promotion-time patching would miss).
+#
+# Each patch MUST be idempotent and MUST hard-fail if the file no longer matches
+# a known shape, so an upstream refactor stops the deploy instead of silently
+# shipping a regression.
+
+# --- shop-domain: multi-environment URL generation -------------------------
+# Without this every instance generates links pointing at the main shop URL
+# (prestashop.pvt.create-store.com) instead of its own hostname, because the
+# 2018 logic only rewrites a domain that literally contains the string "dev1".
+# Leaves the later $host lookup normalisation alone — that one is still needed.
+python3 - "$NEW/override/classes/shop/Shop.php" <<'PYPATCH'
+import io, sys
+
+NEW_BLOCK = """        // Multi-entorno: usar siempre el hostname del request como dominio
+        // de la shop. Asi dev, lab, local y produccion comparten la misma BD
+        // y cada entorno genera URLs con su propio dominio sin tocar main=1.
+        // Sustituye los bloques anteriores de (JF 2018) para dev* y de
+        // Xtras::isBackDomain() para failover - este patron los cubre todos.
+        // [deploy-patch] injected by stage-release.sh - see ENVIRONMENT-PATCHES.md
+        if (!empty($_SERVER['HTTP_HOST'])) {
+"""
+MARKER, START_HINT = "Multi-entorno", "(JF)(25/07/2018)"
+BODY_HINT, END_HINT = "$row['domain'] = str_replace('dev1'", "if (Xtras::isBackDomain()) {"
+
+path = sys.argv[1]
+with io.open(path, encoding="utf-8", errors="surrogateescape") as fh:
+    lines = fh.readlines()
+
+if any(MARKER in ln for ln in lines):
+    print("   shop-domain: already multi-environment, nothing to do")
+    sys.exit(0)
+
+start = None
+for i, ln in enumerate(lines):
+    # anchor on the block that rewrites $row['domain'] — NOT the later one that
+    # rewrites $host for shop lookup, which must survive untouched
+    if START_HINT in ln and any(BODY_HINT in l for l in lines[i:i + 8]):
+        start = i
+        break
+if start is None:
+    sys.exit("FATAL: Shop.php has neither the multi-environment block nor the known 2018\n"
+             "       $row['domain'] block. Upstream changed shape — re-derive this patch\n"
+             "       (ENVIRONMENT-PATCHES.md) instead of deploying blind.")
+
+end = None
+for j in range(start, min(start + 25, len(lines))):
+    if END_HINT in lines[j]:
+        end = j
+        break
+if end is None:
+    sys.exit("FATAL: found the 2018 $row['domain'] block but not the following\n"
+             "       'if (Xtras::isBackDomain()) {' line it must be merged with.")
+
+with io.open(path, "w", encoding="utf-8", errors="surrogateescape") as fh:
+    fh.writelines(lines[:start] + [NEW_BLOCK] + lines[end + 1:])
+print("   shop-domain: patched (replaced the 2018 dev1/isBackDomain blocks, lines %d-%d)"
+      % (start + 1, end + 1))
+PYPATCH
+php -l "$NEW/override/classes/shop/Shop.php" >/dev/null \
+  || { echo "FATAL: Shop.php failed php -l after the environment patch"; exit 1; }
+chown apache:apache "$NEW/override/classes/shop/Shop.php"
 
 echo "== release marker (web-checkable: /RELEASE.txt)"
 {
