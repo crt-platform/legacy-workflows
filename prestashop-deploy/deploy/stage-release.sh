@@ -32,6 +32,16 @@ LAYER1=(
   config/ip_permitidas.php
   override/classes/shop/ShopUrl.php
   health.php
+  # Back-office auth. NOT repo-tracked, and Layer 2 is --ignore-existing, so a
+  # release that ships its own copy silently wins and per-box users are lost.
+  # This bit on 2026-08-17: the dev-only `dev-kris` user vanished from dev1 on
+  # its first deploy, leaving /area-12/ reachable only from allow-listed office
+  # IPs (the other htpasswd users are prod-lineage with unrecoverable plaintext).
+  # A 401 looks identical whether the box is protected or locked out, so this
+  # fails silently — see prestashop/fleet-instance-provisioning.md §7.
+  superadmin/.htpasswd
+  area-12/.htaccess
+  stats/.htpasswd
 )
 for f in "${LAYER1[@]}"; do
   [ -e "$CUR/$f" ] || { echo "FATAL: Layer-1 file missing on active release: $f"; exit 1; }
