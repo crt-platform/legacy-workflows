@@ -52,6 +52,11 @@ on:
         required: false
         default: 'false'
         type: string
+      base:
+        description: "Nearest reachable release tag + distance, e.g. 1.24.0-dev.1+2. Empty when a version was cut."
+        required: false
+        default: ''
+        type: string
       artifact_id:
         required: false
         default: ''
@@ -87,6 +92,7 @@ jobs:
           STATUS: ${{ inputs.status }}
           VERSION: ${{ inputs.version }}
           RELEASED: ${{ inputs.released }}
+          BASE: ${{ inputs.base }}
           ARTIFACT_ID: ${{ inputs.artifact_id }}
           IS_MICROSERVICE: ${{ inputs.is_microservice }}
           ACTOR: ${{ inputs.actor }}
@@ -157,15 +163,26 @@ jobs:
                   f"*branch* `{e['BRANCH']}`{who}",
               ]
           else:
-              # No tag was cut, so `version` is a commit sha. Say so loudly: a dev
-              # who assumes a new semver version exists will go and deploy a stale
-              # one. On prod that assumption is more expensive, hence the tag.
-              lines = [
-                  f"⚠️ *{svc}* — {tag}build produced *no new version* (no feat/fix commits)",
-                  f"*version* `{ver}` (commit sha — still deployable)",
+              # No tag was cut, so `version` is a commit sha. It is deployable, but
+              # it cannot be compared by eye against the semver that Heimdall's
+              # status window shows -- "is 88050aa newer than 1.24.0-dev.1?" has no
+              # answer at a glance. So state the relationship as an equation: which
+              # tag this build descends from, and how far past it it is.
+              #
+              # Deliberately NOT presented as BEING that version. The build is ahead
+              # of the tag, and naming a build after a tag it is not is exactly the
+              # bug the Resolve version step exists to fix.
+              base_tag, _, ahead = e.get("BASE", "").partition("+")
+              lines = [f"\u26a0\ufe0f *{svc}* \u2014 {tag}build has *no new version* (no feat/fix commits)"]
+              if base_tag and ahead.isdigit():
+                  n = int(ahead)
+                  lines.append(f"*this build* = `{base_tag}` + {n} commit{'' if n == 1 else 's'}")
+              lines += [
+                  f"*deploy it as* `{ver}`   \u2190 paste this into Heimdall (commit sha)",
                   art,
                   f"*branch* `{e['BRANCH']}`{who}",
               ]
+          lines = [l for l in lines if l]
           if links:
               lines.append(" · ".join(links))
           print(json.dumps({"text": "\n".join(lines)}))
