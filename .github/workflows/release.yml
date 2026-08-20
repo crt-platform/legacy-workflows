@@ -108,6 +108,7 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       released: ${{ steps.version.outputs.released }}
+      base: ${{ steps.version.outputs.base }}
       artifact-id: ${{ steps.upload-artifact.outputs.artifact-id }}
     steps:
       - name: Checkout
@@ -185,15 +186,31 @@ jobs:
           VERSION=$(git tag --points-at HEAD | grep -E '^[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
           if [ -n "$VERSION" ]; then
             RELEASED=true
+            BASE=""
             echo "semantic-release cut $VERSION"
           else
             VERSION=$(git rev-parse --short=7 HEAD)
             RELEASED=false
-            echo "no new release this run - labelling this build $VERSION (commit sha)"
+            # A sha is deployable but tells nobody WHERE they are: Heimdall's
+            # status window shows semver (e.g. 1.24.0-dev.1), so a bare sha in
+            # Slack cannot be compared against what is running. Report the
+            # nearest reachable release tag and the distance from it, as
+            # `1.24.0-dev.1+2`. Note this is NOT a version we could name the
+            # artifact after: the build is 2 commits PAST that tag, and reusing
+            # the tag's name is precisely the bug this step exists to fix.
+            # The glob keeps `package-v*` tags out while matching x.y.z[-dev.N].
+            TAG=$(git describe --tags --abbrev=0 --match '[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || true)
+            if [ -n "$TAG" ]; then
+              BASE="${TAG}+$(git rev-list --count "${TAG}..HEAD")"
+            else
+              BASE=""
+            fi
+            echo "no new release this run - labelling this build $VERSION (commit sha), based on ${BASE:-<no tags>}"
           fi
           {
             echo "version=$VERSION"
             echo "released=$RELEASED"
+            echo "base=$BASE"
           } >> "$GITHUB_OUTPUT"
       
       - name: Build proyect
@@ -227,7 +244,8 @@ jobs:
               echo "| **version (paste into Heimdall)** | \`${{ steps.version.outputs.version }}\` |"
             else
               echo "> :warning: **No new version was cut this run** (no feat/fix commits)."
-              echo "> The build is labelled with its commit sha, which Heimdall can still deploy."
+              echo "> This build is \`${{ steps.version.outputs.base }}\` — i.e. that tag plus"
+              echo "> the commits after it — labelled with its commit sha, which Heimdall deploys."
               echo ""
               echo "| | |"; echo "|---|---|"
               echo "| **version (paste into Heimdall)** | \`${{ steps.version.outputs.version }}\` |"
@@ -266,6 +284,7 @@ jobs:
           STATUS: ${{ needs.detect-release-scope.result != 'success' && needs.detect-release-scope.result || needs.release.result }}
           VERSION: ${{ needs.release.outputs.version }}
           RELEASED: ${{ needs.release.outputs.released }}
+          BASE: ${{ needs.release.outputs.base }}
           ARTIFACT_ID: ${{ needs.release.outputs.artifact-id }}
           IS_MICROSERVICE: ${{ inputs.is-microservice }}
           ACTOR: ${{ github.actor }}
@@ -284,6 +303,7 @@ jobs:
                   "status":          e["STATUS"],
                   "version":         e.get("VERSION") or "",
                   "released":        e.get("RELEASED") or "false",
+                  "base":            e.get("BASE") or "",
                   "artifact_id":     e.get("ARTIFACT_ID") or "",
                   "is_microservice": e.get("IS_MICROSERVICE") or "false",
                   "actor":           e.get("ACTOR") or "",
