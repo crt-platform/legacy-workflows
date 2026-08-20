@@ -14,6 +14,16 @@ on:
         required: false
         default: 'package_src'
         type: string
+      notify:
+        description: 'Post the release result to Slack.'
+        required: false
+        default: true
+        type: boolean
+      notifier-ref:
+        description: 'Ref of notify-release.yml in legacy-workflows to dispatch. Override only to test an unmerged branch.'
+        required: false
+        default: 'main'
+        type: string
 
 concurrency:
   group: release-${{ github.repository }}-${{ github.ref_name }}
@@ -95,6 +105,10 @@ jobs:
     needs: detect-release-scope
     name: Release
     runs-on: ms
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      released: ${{ steps.version.outputs.released }}
+      artifact-id: ${{ steps.upload-artifact.outputs.artifact-id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -151,9 +165,36 @@ jobs:
       - name: Release
         run: npx semantic-release
 
-      - name: Get tag microservice
-        if: ${{ env.IS_MICROSERVICE == 'true' }}
-        run: echo TAG_VERSION=$(git tag -l | sort -V | grep -i '^[1-9]' | tail -n 1) >> $GITHUB_ENV
+      # Heimdall runs `git checkout <version>` on the target box
+      # (deployment-execute-deploy.service.ts:233), so <version> MUST be a
+      # valid git ref: the tag when semantic-release cut one, otherwise the
+      # commit sha. NEVER tag+sha -- `1.63.0-dev.1-e887f34` resolves to
+      # nothing and the deploy dies at checkout, after the artifact is
+      # already on the box.
+      #
+      # The old logic was `git tag -l | sort -V | grep -i '^[1-9]' | tail -n 1`
+      # -- the highest tag in the WHOLE repo, not the one just cut. On a push
+      # that cuts no release it renamed the build after an ALREADY-USED
+      # version, so one artifact name pointed at two different builds; Heimdall
+      # then paired the newer dist/ with the older source tree and lock file.
+      # Hit on ecom.notification 2026-07-14 and global.third-party 2026-07-16.
+      # It also dropped any 0.x tag on the floor (`^[1-9]`), yielding `main-`.
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION=$(git tag --points-at HEAD | grep -E '^[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+          if [ -n "$VERSION" ]; then
+            RELEASED=true
+            echo "semantic-release cut $VERSION"
+          else
+            VERSION=$(git rev-parse --short=7 HEAD)
+            RELEASED=false
+            echo "no new release this run - labelling this build $VERSION (commit sha)"
+          fi
+          {
+            echo "version=$VERSION"
+            echo "released=$RELEASED"
+          } >> "$GITHUB_OUTPUT"
       
       - name: Build proyect
         run: npm run build
@@ -171,11 +212,98 @@ jobs:
         if: ${{ env.IS_MICROSERVICE == 'true' }}
         uses: actions/upload-artifact@v6
         with:
-          name: main-${{ env.TAG_VERSION }}
+          name: main-${{ steps.version.outputs.version }}
           path: |
             dist.gz
 
-      - name: Log artifact ID
+      - name: Summarise the build
         if: ${{ env.IS_MICROSERVICE == 'true' }}
-        run: echo "Artifact ID ${{ steps.upload-artifact.outputs.artifact-id }}"
+        run: |
+          {
+            echo "### Deployable build"
+            echo ""
+            if [ "${{ steps.version.outputs.released }}" = "true" ]; then
+              echo "| | |"; echo "|---|---|"
+              echo "| **version (paste into Heimdall)** | \`${{ steps.version.outputs.version }}\` |"
+            else
+              echo "> :warning: **No new version was cut this run** (no feat/fix commits)."
+              echo "> The build is labelled with its commit sha, which Heimdall can still deploy."
+              echo ""
+              echo "| | |"; echo "|---|---|"
+              echo "| **version (paste into Heimdall)** | \`${{ steps.version.outputs.version }}\` |"
+            fi
+            echo "| artifact | \`main-${{ steps.version.outputs.version }}\` |"
+            echo "| artifact id | \`${{ steps.upload-artifact.outputs.artifact-id }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
       
+
+  # Hands the result to notify-release.yml in legacy-workflows, which posts it.
+  # It cannot be posted from here: this is a REUSABLE workflow, so it can read
+  # neither an org secret (the ~50 callers pass only `token`) nor an org
+  # variable (`vars.` reads the Variables tab; the webhook lives under
+  # Secrets -- confirmed 2026-08-20). The notifier runs in legacy-workflows'
+  # own context, where the org secret resolves normally: the webhook stays
+  # masked and no service repo needs any change.
+  #
+  # Its own job (not a step in `release`) so a release that FAILS or never
+  # starts still reports -- a step can only speak for a job that ran.
+  notify:
+    name: Notify Slack
+    needs: [detect-release-scope, release]
+    # Report on success and on failure, but stay quiet on a deliberate skip
+    # (a package_src-only push, or [skip ci]) -- that is not news. A FAILED
+    # detect-release-scope also skips `release`, and that IS news, hence the
+    # two-part condition.
+    if: ${{ always() && inputs.notify && (needs.detect-release-scope.result != 'success' || needs.release.result != 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch the Slack notification
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          NOTIFIER_REF: ${{ inputs.notifier-ref }}
+          REPO_FULL: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          STATUS: ${{ needs.detect-release-scope.result != 'success' && needs.detect-release-scope.result || needs.release.result }}
+          VERSION: ${{ needs.release.outputs.version }}
+          RELEASED: ${{ needs.release.outputs.released }}
+          ARTIFACT_ID: ${{ needs.release.outputs.artifact-id }}
+          IS_MICROSERVICE: ${{ inputs.is-microservice }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # json.dumps, not string interpolation: branch names and commit authors
+          # are free text and would otherwise break or inject into the payload.
+          python3 - > /tmp/dispatch.json <<'PY'
+          import json, os
+          e = os.environ
+          print(json.dumps({
+              "ref": e["NOTIFIER_REF"],
+              "inputs": {
+                  "service":         e["REPO_FULL"],
+                  "branch":          e["BRANCH"],
+                  "status":          e["STATUS"],
+                  "version":         e.get("VERSION") or "",
+                  "released":        e.get("RELEASED") or "false",
+                  "artifact_id":     e.get("ARTIFACT_ID") or "",
+                  "is_microservice": e.get("IS_MICROSERVICE") or "false",
+                  "actor":           e.get("ACTOR") or "",
+                  "run_url":         e.get("RUN_URL") or "",
+              },
+          }))
+          PY
+          CODE=$(curl -s -o /tmp/resp.txt -w '%{http_code}' -m 20 -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/crt-platform/legacy-workflows/actions/workflows/notify-release.yml/dispatches" \
+            --data @/tmp/dispatch.json) || CODE=000
+          if [ "$CODE" = "204" ]; then
+            echo "notification dispatched (HTTP 204) -> legacy-workflows / Notify release to Slack"
+          else
+            # Never fail a release over a notification. Diagnose instead.
+            echo "::warning::could not dispatch the Slack notification (HTTP $CODE)"
+            echo "::warning::$(head -c 300 /tmp/resp.txt | tr -d '\n')"
+            echo "::warning::403/404 usually means GH_TOKEN lacks workflow (actions:write)"
+            echo "::warning::scope on crt-platform/legacy-workflows, or notify-release.yml"
+            echo "::warning::does not exist on ref '$NOTIFIER_REF'."
+          fi
