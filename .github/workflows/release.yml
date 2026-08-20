@@ -4,6 +4,25 @@ on:
     secrets:
       token:
         required: true
+      slack-webhook:
+        # OPTIONAL SECOND SOURCE for the #dev-releases webhook, and the reason
+        # this workflow does not depend on an unverified assumption.
+        #
+        # Primary source is the org VARIABLE vars.SLACK_WEBHOOK_URL_DEV_RELEASES,
+        # which needs no caller change. If it turns out a called workflow cannot
+        # read org variables (UNVERIFIED as of 2026-08-19 — see the probe in the
+        # notify job), callers can pass this secret instead and nothing here
+        # changes:
+        #     secrets:
+        #       token: ${{ secrets.GH_TOKEN }}
+        #       slack-webhook: ${{ secrets.SLACK_WEBHOOK_URL_DEV_RELEASES }}
+        # migrate.py would then inject that line the same way it already injects
+        # the three Maverick deploy secrets (migrate.py:86-88).
+        required: false
+      slack-webhook-prod:
+        # Same, for the prod channel. master/main releases are routed to a
+        # SEPARATE channel from dev prereleases -- see the notify job.
+        required: false
     inputs:
       is-microservice:
         required: false
@@ -14,6 +33,11 @@ on:
         required: false
         default: 'package_src'
         type: string
+      notify:
+        description: 'Post the release result to Slack #dev-releases.'
+        required: false
+        default: true
+        type: boolean
 
 concurrency:
   group: release-${{ github.repository }}-${{ github.ref_name }}
@@ -95,6 +119,11 @@ jobs:
     needs: detect-release-scope
     name: Release
     runs-on: ms
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      released: ${{ steps.version.outputs.released }}
+      artifact-id: ${{ steps.upload-artifact.outputs.artifact-id }}
+      artifact-url: ${{ steps.upload-artifact.outputs.artifact-url }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -151,9 +180,36 @@ jobs:
       - name: Release
         run: npx semantic-release
 
-      - name: Get tag microservice
-        if: ${{ env.IS_MICROSERVICE == 'true' }}
-        run: echo TAG_VERSION=$(git tag -l | sort -V | grep -i '^[1-9]' | tail -n 1) >> $GITHUB_ENV
+      # Heimdall runs `git checkout <version>` on the target box
+      # (deployment-execute-deploy.service.ts:233), so <version> MUST be a
+      # valid git ref: the tag when semantic-release cut one, otherwise the
+      # commit sha. NEVER tag+sha -- `1.63.0-dev.1-e887f34` resolves to
+      # nothing and the deploy dies at checkout, after the artifact is
+      # already on the box.
+      #
+      # The old logic was `git tag -l | sort -V | grep -i '^[1-9]' | tail -n 1`
+      # -- the highest tag in the WHOLE repo, not the one just cut. On a push
+      # that cuts no release it renamed the build after an ALREADY-USED
+      # version, so one artifact name pointed at two different builds; Heimdall
+      # then paired the newer dist/ with the older source tree and lock file.
+      # Hit on ecom.notification 2026-07-14 and global.third-party 2026-07-16.
+      # It also dropped any 0.x tag on the floor (`^[1-9]`), yielding `main-`.
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION=$(git tag --points-at HEAD | grep -E '^[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+          if [ -n "$VERSION" ]; then
+            RELEASED=true
+            echo "semantic-release cut $VERSION"
+          else
+            VERSION=$(git rev-parse --short=7 HEAD)
+            RELEASED=false
+            echo "no new release this run - labelling this build $VERSION (commit sha)"
+          fi
+          {
+            echo "version=$VERSION"
+            echo "released=$RELEASED"
+          } >> "$GITHUB_OUTPUT"
       
       - name: Build proyect
         run: npm run build
@@ -171,11 +227,160 @@ jobs:
         if: ${{ env.IS_MICROSERVICE == 'true' }}
         uses: actions/upload-artifact@v6
         with:
-          name: main-${{ env.TAG_VERSION }}
+          name: main-${{ steps.version.outputs.version }}
           path: |
             dist.gz
 
-      - name: Log artifact ID
+      - name: Summarise the build
         if: ${{ env.IS_MICROSERVICE == 'true' }}
-        run: echo "Artifact ID ${{ steps.upload-artifact.outputs.artifact-id }}"
+        run: |
+          {
+            echo "### Deployable build"
+            echo ""
+            if [ "${{ steps.version.outputs.released }}" = "true" ]; then
+              echo "| | |"; echo "|---|---|"
+              echo "| **version (paste into Heimdall)** | \`${{ steps.version.outputs.version }}\` |"
+            else
+              echo "> :warning: **No new version was cut this run** (no feat/fix commits)."
+              echo "> The build is labelled with its commit sha, which Heimdall can still deploy."
+              echo ""
+              echo "| | |"; echo "|---|---|"
+              echo "| **version (paste into Heimdall)** | \`${{ steps.version.outputs.version }}\` |"
+            fi
+            echo "| artifact | \`main-${{ steps.version.outputs.version }}\` |"
+            echo "| artifact id | \`${{ steps.upload-artifact.outputs.artifact-id }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
       
+
+  # Posts the result to Slack #dev-releases (C0BR761CFC6).
+  #
+  # The webhook comes from an ORG-LEVEL VARIABLE, not a secret, and that is a
+  # deliberate trade: a reusable workflow can only see the secrets its caller
+  # explicitly passes it, and the ~50 service repos pass exactly one (`token`).
+  # An org secret would therefore be invisible here without editing every
+  # caller -- the same constraint that forced release-maverick-crt.yml to
+  # declare aws-role-arn / spa-bucket / cloudfront-distribution-id as passed
+  # secrets, with migrate.py injecting the pass-through. A variable needs no
+  # caller change at all. It is NOT masked by GitHub, so the step masks it
+  # itself before doing anything else.
+  #
+  # Its own job (not a step in `release`) so a release that FAILS or never
+  # starts still reports -- a step can only speak for a job that ran.
+  notify:
+    name: Notify Slack
+    needs: [detect-release-scope, release]
+    # Report on success and on failure, but stay quiet on a deliberate skip
+    # (a package_src-only push, or [skip ci]) -- that is not news. A FAILED
+    # detect-release-scope also skips `release`, and that IS news, hence the
+    # two-part condition.
+    if: ${{ always() && inputs.notify && (needs.detect-release-scope.result != 'success' || needs.release.result != 'skipped') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post to Slack
+        env:
+          # Two channels, picked by branch in the script below.
+          #
+          # Index syntax, not `secrets.slack-webhook`: a hyphen in a property
+          # name risks being parsed as subtraction, and the failure mode would be
+          # an empty value and a silently unsent notification. release-maverick-crt.yml
+          # uses dot notation for its hyphenated secrets, but a silent miss is not
+          # worth the stylistic consistency here.
+          HOOK_DEV: ${{ secrets['slack-webhook'] || vars.SLACK_WEBHOOK_URL_DEV_RELEASES }}
+          HOOK_PROD: ${{ secrets['slack-webhook-prod'] || vars.SLACK_WEBHOOK_URL_PROD_RELEASES }}
+          # github.repository, not github.event.repository.name: the former is
+          # present on every event type, the latter depends on the payload shape.
+          REPO_FULL: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          STATUS: ${{ needs.detect-release-scope.result != 'success' && needs.detect-release-scope.result || needs.release.result }}
+          VERSION: ${{ needs.release.outputs.version }}
+          RELEASED: ${{ needs.release.outputs.released }}
+          ARTIFACT_ID: ${{ needs.release.outputs.artifact-id }}
+          ARTIFACT_URL: ${{ needs.release.outputs.artifact-url }}
+          IS_MICROSERVICE: ${{ inputs.is-microservice }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          HEIMDALL_URL: http://heimdall-dev.pvt.create-store.com:8080
+        run: |
+          # Variables are never masked by GitHub. Mask both before any other
+          # command in this job can echo one -- `set -x`, `curl -v` or a future
+          # debug line would otherwise print a live posting credential into
+          # logs that anyone with repo read can see.
+          echo "::add-mask::$HOOK_DEV"
+          echo "::add-mask::$HOOK_PROD"
+
+          # Route by branch. master/main are the release branches, where
+          # semantic-release cuts a real x.y.z; dev cuts x.y.z-dev.N
+          # prereleases. Anything else is treated as non-prod.
+          case "$BRANCH" in
+            master|main) HOOK="$HOOK_PROD"; IS_PROD=true;  WHICH=PROD ;;
+            *)           HOOK="$HOOK_DEV";  IS_PROD=false; WHICH=DEV  ;;
+          esac
+          export IS_PROD
+
+          # Deliberately NO cross-channel fallback: posting a prod release into
+          # the dev channel (or the reverse) invites someone to deploy the wrong
+          # build. A missing webhook is loud and silent, not misdirected.
+          if [ -z "$HOOK" ]; then
+            echo "::warning::No $WHICH webhook available - nothing posted."
+            echo "::warning::Set org variable SLACK_WEBHOOK_URL_${WHICH}_RELEASES, or pass the"
+            echo "::warning::corresponding slack-webhook secret from the caller. If the org"
+            echo "::warning::variable IS set and this still fires, a called workflow cannot read"
+            echo "::warning::org variables -> use the passed-secret route."
+            exit 0
+          fi
+          # Built with json.dumps rather than interpolated into `curl -d`:
+          # branch names and commit authors are free text, and a stray quote
+          # would either break the JSON or inject into it.
+          python3 - <<'PY' > /tmp/payload.json
+          import json, os
+          e = os.environ
+          svc = e["REPO_FULL"].split("/")[-1]
+          ver = e.get("VERSION") or ""
+          status = e["STATUS"]
+          released = e.get("RELEASED") == "true"
+          is_ms = e.get("IS_MICROSERVICE") == "true"
+          is_prod = e.get("IS_PROD") == "true"
+          tag = "PROD " if is_prod else ""
+
+          links = [f"<{e['RUN_URL']}|Actions run>"]
+          if e.get("ARTIFACT_URL"):
+              links.append(f"<{e['ARTIFACT_URL']}|artifact>")
+          # The Heimdall link is the create-dev console, so it is offered only for
+          # dev builds. A prod release is deployed from the desktop app against a
+          # different infrastructure, and linking a create-dev box next to a prod
+          # version is how someone ends up deploying into the wrong environment.
+          if is_ms and status == "success" and not is_prod:
+              links.append(f"<{e['HEIMDALL_URL']}|Heimdall>")
+          who = f" \u00b7 by {e['ACTOR']}" if e.get("ACTOR") else ""
+          art = f"*artifact* `main-{ver}`" + (f"  (id `{e['ARTIFACT_ID']}`)" if e.get("ARTIFACT_ID") else "")
+
+          if status != "success":
+              lines = [f"\u274c *{svc}* \u2014 {tag}release *{status}* on `{e['BRANCH']}`{who}"]
+          elif not is_ms:
+              lines = [f"\u2705 *{svc}* \u2014 {tag}released `{ver}` on `{e['BRANCH']}`{who} (no artifact: not a microservice)"]
+          elif released:
+              head = (f"\U0001f680 *{svc}* \u2014 *PROD release* `{ver}` ready to deploy"
+                      if is_prod else f"\u2705 *{svc}* \u2014 build ready to deploy")
+              lines = [
+                  head,
+                  f"*version* `{ver}`   \u2190 paste this into Heimdall",
+                  art,
+                  f"*branch* `{e['BRANCH']}`{who}",
+              ]
+          else:
+              # No tag was cut, so `version` is a commit sha. Say so loudly: a dev
+              # who assumes a new semver version exists will go and deploy a stale
+              # one. On prod that assumption is more expensive, hence the tag.
+              lines = [
+                  f"\u26a0\ufe0f *{svc}* \u2014 {tag}build produced *no new version* (no feat/fix commits)",
+                  f"*version* `{ver}` (commit sha \u2014 still deployable)",
+                  art,
+                  f"*branch* `{e['BRANCH']}`{who}",
+              ]
+          lines.append(" \u00b7 ".join(links))
+          print(json.dumps({"text": "\n".join(lines)}))
+          PY
+          # Never fail a release over a Slack hiccup -- but do surface it.
+          curl -sS -m 15 -X POST -H 'Content-Type: application/json' \
+            --data @/tmp/payload.json "$HOOK" \
+            || echo "::warning::could not post to Slack"
