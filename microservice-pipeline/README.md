@@ -8,6 +8,7 @@
 |---|---|
 | `migrate.py` | the transform — encodes the 11 steps of `crt-agents/ci-cd/repo-migration.md` |
 | `redirects.json` | reference table — **printing disabled 2026-07-31** (see below), kept as documentation |
+| `ryan-local.sh` | the same promotion, run from a laptop — for a branch that exists **only** in crt-platform, which `/ryan` cannot reach ([below](#ryan-localsh--promoting-a-branch-that-only-exists-in-crt-platform)) |
 
 > **`redirects.json` is currently not surfaced.** The workflow used to dump it
 > when dependency validation failed; that was switched off by request because
@@ -146,6 +147,55 @@ MIGRATE_ROOT=/path/to/repo python3 migrate.py <repo-name>
 Idempotent — a second run makes no changes. Exit codes: `0` ok, `4` assertion
 failed (an ndcmsl reference survived in a file this script owns), `2` usage.
 `3` used to mean "refused: Maverick SPA" and is no longer emitted.
+
+## `ryan-local.sh` — promoting a branch that only exists in crt-platform
+
+`promote-microservice.yml` hardcodes `UPSTREAM_ORG: ndcmsl` and gets the source
+branch with `git fetch upstream refs/heads/<src>`. So a branch that exists
+**only in crt-platform** cannot be promoted at all — not by `/ryan`, not by
+manual dispatch, there is no input for the source org. That happens whenever a
+developer has no push access to ndcmsl and lands the work on crt-platform
+directly (real case: `ecom-legacy.etl.write:feature/ITMAVERICK-1936…`).
+
+`ryan-local.sh` performs the same promotion from a laptop. It does **not**
+reimplement the transform — it calls the `migrate.py` sitting next to it, so the
+two cannot drift:
+
+```
+cd <service repo>
+bash ryan-local.sh --check      # report, in place, writes nothing
+bash ryan-local.sh              # transform + commit on a throwaway _promote
+bash ryan-local.sh --push       # ... and force-update dev
+```
+
+Everything else is derived: the service name and target org from the git remote,
+`--release-branch` from the target repo's default branch (the same
+`refs/remotes/*/HEAD` lookup the workflow does), the source ref from the current
+HEAD. `--migrate-py` / `$LEGACY_WORKFLOWS` override the transform's location, and
+without a local copy it shallow-clones this repo and cleans up after itself.
+
+Step-for-step correspondence with the workflow:
+
+| `promote-microservice.yml` | `ryan-local.sh` |
+|---|---|
+| validate inputs, refuse `master\|main\|lab\|develop` (step `v`) | same, plus it refuses any remote that is not crt-platform |
+| `git fetch upstream refs/heads/<src>` | *skipped* — the source is already local; this is the whole point |
+| `git checkout -B _promote FETCH_HEAD` | `git checkout -B _promote <source sha>` — your branch is never modified |
+| resolve target default branch → `--release-branch` | same lookup, `--release-branch` overrides |
+| `migrate.py`, `git add -A`, one commit | same, same commit-message shape, also idempotent |
+| `npm ci --dry-run --ignore-scripts` gate | same; also warns when local npm is not major 10 (the lock trap), and restores your branch on failure |
+| `git push origin +_promote:refs/heads/<dest>` | same, opt-in via `--push` and confirmed by typing the branch name |
+| run summary with the post-merge checklist | printed on success |
+
+Deliberate differences, all in the safe direction: nothing is pushed without
+`--push`, a dirty working tree is refused (`git add -A` would sweep unrelated
+edits into the pipeline commit), and no PR is opened — the local flow targets
+`dev`, where the workflow would not open one either.
+
+⚠ It inherits the residual risk below, and makes it sharper: code promoted this
+way exists only in crt-platform, so **the next `/ryan` on that repo force-pushes
+`dev` from ndcmsl and drops it.** The script prints this warning after pushing.
+The durable fix is getting the commits into ndcmsl.
 
 ## Flow
 
