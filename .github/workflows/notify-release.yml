@@ -43,35 +43,14 @@ on:
         required: true
         type: string
       version:
-        description: "tag semantic-release cut, or the commit sha when it cut none"
+        description: "Tag semantic-release cut, or the commit sha when it cut none"
         required: false
         default: ''
         type: string
-      released:
-        description: "'true' when a new version tag was actually cut"
+      extra:
+        description: "JSON blob: released, base, recycled, artifact_id, is_microservice, actor, run_url. A blob because workflow_dispatch caps at 10 named inputs and we reached it."
         required: false
-        default: 'false'
-        type: string
-      base:
-        description: "Nearest reachable release tag + distance, e.g. 1.24.0-dev.1+2. Empty when a version was cut."
-        required: false
-        default: ''
-        type: string
-      artifact_id:
-        required: false
-        default: ''
-        type: string
-      is_microservice:
-        required: false
-        default: 'false'
-        type: string
-      actor:
-        required: false
-        default: ''
-        type: string
-      run_url:
-        required: false
-        default: ''
+        default: '{}'
         type: string
 
 concurrency:
@@ -91,12 +70,7 @@ jobs:
           BRANCH: ${{ inputs.branch }}
           STATUS: ${{ inputs.status }}
           VERSION: ${{ inputs.version }}
-          RELEASED: ${{ inputs.released }}
-          BASE: ${{ inputs.base }}
-          ARTIFACT_ID: ${{ inputs.artifact_id }}
-          IS_MICROSERVICE: ${{ inputs.is_microservice }}
-          ACTOR: ${{ inputs.actor }}
-          RUN_URL: ${{ inputs.run_url }}
+          EXTRA: ${{ inputs.extra }}
           HEIMDALL_URL: http://heimdall-dev.pvt.create-store.com:8080
         run: |
           # Secrets ARE masked by GitHub, but guard anyway: masking "" emits
@@ -129,25 +103,28 @@ jobs:
           python3 - <<'PY' > /tmp/payload.json
           import json, os
           e = os.environ
+          # Everything except the four named inputs arrives as one JSON blob.
+          x = json.loads(e.get("EXTRA") or "{}")
           svc = e["REPO_FULL"].split("/")[-1]
           ver = e.get("VERSION") or ""
           status = e["STATUS"]
-          released = e.get("RELEASED") == "true"
-          is_ms = e.get("IS_MICROSERVICE") == "true"
+          released = x.get("released") == "true"
+          recycled = x.get("recycled") == "true"
+          is_ms = x.get("is_microservice") == "true"
           is_prod = e.get("IS_PROD") == "true"
           tag = "PROD " if is_prod else ""
 
           links = []
-          if e.get("RUN_URL"):
-              links.append(f"<{e['RUN_URL']}|Actions run>")
+          if x.get("run_url"):
+              links.append(f"<{x['run_url']}|Actions run>")
           # The Heimdall link is the create-dev console, so it is offered only for
           # dev builds. A prod release is deployed from the desktop app against a
           # different infrastructure, and linking a create-dev box next to a prod
           # version is how someone ends up deploying into the wrong environment.
           if is_ms and status == "success" and not is_prod:
               links.append(f"<{e['HEIMDALL_URL']}|Heimdall>")
-          who = f" · by {e['ACTOR']}" if e.get("ACTOR") else ""
-          art = f"*artifact* `main-{ver}`" + (f"  (id `{e['ARTIFACT_ID']}`)" if e.get("ARTIFACT_ID") else "")
+          who = f" · by {x['actor']}" if x.get("actor") else ""
+          art = f"*artifact* `main-{ver}`" + (f"  (id `{x['artifact_id']}`)" if x.get("artifact_id") else "")
 
           if status != "success":
               lines = [f"❌ *{svc}* — {tag}release *{status}* on `{e['BRANCH']}`{who}"]
@@ -159,6 +136,14 @@ jobs:
               lines = [
                   head,
                   f"*version* `{ver}`   ← paste this into Heimdall",
+                  # A /ryan promotion force-pushes the branch; the prune step then
+                  # removes the orphaned prerelease tags so semantic-release can
+                  # run, which also resets its counter -- so this number may have
+                  # belonged to different code before, and the old artifact of the
+                  # same name can survive for 90 days. Not preventable here, so
+                  # say it where someone about to deploy will read it.
+                  (f"⚠️ *number reused* — `{ver}` previously pointed at a different "
+                   f"build (replaced by a promotion)" if recycled else ""),
                   art,
                   f"*branch* `{e['BRANCH']}`{who}",
               ]
@@ -172,7 +157,7 @@ jobs:
               # Deliberately NOT presented as BEING that version. The build is ahead
               # of the tag, and naming a build after a tag it is not is exactly the
               # bug the Resolve version step exists to fix.
-              base_tag, _, ahead = e.get("BASE", "").partition("+")
+              base_tag, _, ahead = x.get("base", "").partition("+")
               lines = [f"\u26a0\ufe0f *{svc}* \u2014 {tag}build has *no new version* (no feat/fix commits)"]
               if base_tag and ahead.isdigit():
                   n = int(ahead)
