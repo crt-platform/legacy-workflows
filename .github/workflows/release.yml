@@ -109,6 +109,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       released: ${{ steps.version.outputs.released }}
       base: ${{ steps.version.outputs.base }}
+      recycled: ${{ steps.version.outputs.recycled }}
       artifact-id: ${{ steps.upload-artifact.outputs.artifact-id }}
     steps:
       - name: Checkout
@@ -126,7 +127,12 @@ jobs:
           git pull --rebase origin ${{ github.ref_name }}
           git fetch origin +refs/notes/semantic-release:refs/notes/semantic-release || true
       - name: Prune orphaned prerelease tags
+        id: prune
         run: |
+          # Deleted tags are recorded to a FILE, not a shell variable: the `while`
+          # body below is the right-hand side of a pipe and therefore runs in a
+          # subshell, so anything assigned inside it would be lost on exit.
+          : > /tmp/pruned-tags
           # A /ryan promotion force-pushes this branch, orphaning its previous
           # tip. Prerelease tags on the orphaned commits survive (tags are
           # separate refs), so semantic-release cannot see them as prior
@@ -151,7 +157,15 @@ jobs:
             fi
             git push origin ":refs/tags/${tag}"
             git tag -d "${tag}"
+            echo "${tag}" >> /tmp/pruned-tags
           done
+          PRUNED=$(paste -sd' ' /tmp/pruned-tags 2>/dev/null || true)
+          echo "pruned=${PRUNED}" >> "$GITHUB_OUTPUT"
+          if [ -n "$PRUNED" ]; then
+            echo "pruned: ${PRUNED}"
+          else
+            echo "nothing to prune"
+          fi
       # - name: Setup Node.js
       #   uses: actions/setup-node@v5
       #   with:
@@ -182,12 +196,30 @@ jobs:
       # It also dropped any 0.x tag on the floor (`^[1-9]`), yielding `main-`.
       - name: Resolve version
         id: version
+        env:
+          PRUNED_TAGS: ${{ steps.prune.outputs.pruned }}
         run: |
           VERSION=$(git tag --points-at HEAD | grep -E '^[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -1 || true)
+          RECYCLED=false
           if [ -n "$VERSION" ]; then
             RELEASED=true
             BASE=""
             echo "semantic-release cut $VERSION"
+            # A /ryan promotion force-pushes the branch, orphaning the previous
+            # tip; the prune step above then deletes its prerelease tags so
+            # semantic-release can run at all. But semantic-release only counts
+            # tags REACHABLE from the branch, so with those gone it restarts the
+            # counter -- 1.371.0-dev.2 can become 1.371.0-dev.1 again, pointing
+            # at different code (maverick-logistic-bff, 2026-08-20). The number
+            # is not monotonic across a promotion, and the old artifact of the
+            # same name can still exist for 90 days. We cannot prevent that here,
+            # so we detect it and say so.
+            case " ${PRUNED_TAGS} " in
+              *" ${VERSION} "*)
+                RECYCLED=true
+                echo "WARNING: ${VERSION} was just pruned and re-cut - the number is reused"
+                ;;
+            esac
           else
             VERSION=$(git rev-parse --short=7 HEAD)
             RELEASED=false
@@ -211,6 +243,7 @@ jobs:
             echo "version=$VERSION"
             echo "released=$RELEASED"
             echo "base=$BASE"
+            echo "recycled=$RECYCLED"
           } >> "$GITHUB_OUTPUT"
       
       - name: Build proyect
@@ -285,6 +318,7 @@ jobs:
           VERSION: ${{ needs.release.outputs.version }}
           RELEASED: ${{ needs.release.outputs.released }}
           BASE: ${{ needs.release.outputs.base }}
+          RECYCLED: ${{ needs.release.outputs.recycled }}
           ARTIFACT_ID: ${{ needs.release.outputs.artifact-id }}
           IS_MICROSERVICE: ${{ inputs.is-microservice }}
           ACTOR: ${{ github.actor }}
@@ -295,19 +329,26 @@ jobs:
           python3 - > /tmp/dispatch.json <<'PY'
           import json, os
           e = os.environ
+          # Four named inputs (they show up in the notifier's run-name) plus one
+          # JSON blob for the rest. GitHub caps workflow_dispatch at 10 inputs and
+          # we hit that ceiling the moment `recycled` was needed -- the blob is
+          # what keeps this extensible without another refactor.
           print(json.dumps({
               "ref": e["NOTIFIER_REF"],
               "inputs": {
-                  "service":         e["REPO_FULL"],
-                  "branch":          e["BRANCH"],
-                  "status":          e["STATUS"],
-                  "version":         e.get("VERSION") or "",
-                  "released":        e.get("RELEASED") or "false",
-                  "base":            e.get("BASE") or "",
-                  "artifact_id":     e.get("ARTIFACT_ID") or "",
-                  "is_microservice": e.get("IS_MICROSERVICE") or "false",
-                  "actor":           e.get("ACTOR") or "",
-                  "run_url":         e.get("RUN_URL") or "",
+                  "service": e["REPO_FULL"],
+                  "branch":  e["BRANCH"],
+                  "status":  e["STATUS"],
+                  "version": e.get("VERSION") or "",
+                  "extra": json.dumps({
+                      "released":        e.get("RELEASED") or "false",
+                      "base":            e.get("BASE") or "",
+                      "recycled":        e.get("RECYCLED") or "false",
+                      "artifact_id":     e.get("ARTIFACT_ID") or "",
+                      "is_microservice": e.get("IS_MICROSERVICE") or "false",
+                      "actor":           e.get("ACTOR") or "",
+                      "run_url":         e.get("RUN_URL") or "",
+                  }),
               },
           }))
           PY
