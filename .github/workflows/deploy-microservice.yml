@@ -1,0 +1,137 @@
+# Deploy a microservice to create-dev without Heimdall.
+#
+# MANUAL ONLY for now (workflow_dispatch). The automatic dispatch from
+# release.yml is deliberately NOT wired yet: the first live reloads happen while
+# someone is watching. Design: crt-agents/ci-cd/heimdall-deprecation.md
+#
+# Hosted and dispatched HERE rather than being reusable, for the same reason as
+# notify-release.yml: a called workflow cannot read an org secret, and the ~50
+# service repos pass only `token`. Dispatched, it runs in this repo's context,
+# so SSH_DEPLOY_KEY_CRT_DEV resolves and no service repo needs any change.
+#
+# Rollout is gated by DATA, not by this file: if
+# <service>/deploy/<env>.yaml is absent in ms-deploy, the job skips and the
+# service stays on Heimdall.
+name: Deploy microservice
+
+run-name: "${{ inputs.mode }} ${{ inputs.service }} ${{ inputs.version }} -> ${{ inputs.environment }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      service:
+        description: "Service name, e.g. global.content"
+        required: true
+        type: string
+      version:
+        description: "Tag (1.2.3-dev.4) or the 7-char commit sha of a build with no new version"
+        required: true
+        type: string
+      mode:
+        description: "plan = verify only · stage = everything except pm2 reload · deploy = for real"
+        required: true
+        default: plan
+        type: choice
+        options: [plan, stage, deploy]
+      environment:
+        description: "Environment key in ms-deploy/deploy/environments.yaml"
+        required: false
+        default: crt_dev
+        type: string
+      hosts:
+        description: "Comma list overriding the service YAML, e.g. ms01"
+        required: false
+        default: ''
+        type: string
+      ms_deploy_ref:
+        description: "ms-deploy ref to read config from (main is what ships)"
+        required: false
+        default: main
+        type: string
+      force_npm_ci:
+        required: false
+        default: false
+        type: boolean
+      clear_cache:
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  # Never two deploys of the same service at once: they would race one
+  # node_modules and interleave pm2 reloads.
+  group: deploy-${{ inputs.service }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: "${{ inputs.mode }} ${{ inputs.service }}"
+    runs-on: ms
+    steps:
+      - name: Checkout legacy-workflows
+        uses: actions/checkout@v4
+
+      - name: Checkout ms-deploy config
+        uses: actions/checkout@v4
+        with:
+          repository: crt-platform/ms-deploy
+          ref: ${{ inputs.ms_deploy_ref }}
+          token: ${{ secrets.GH_TOKEN }}
+          path: .ms-deploy
+
+      - name: Download the build artifact
+        if: ${{ inputs.mode != 'plan' }}
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          SERVICE: ${{ inputs.service }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          NAME="main-${VERSION}"
+          ID=$(gh api "repos/crt-platform/${SERVICE}/actions/artifacts?name=${NAME}" \
+                 --jq '.artifacts[0].id // empty')
+          if [ -z "$ID" ]; then
+            echo "::error::no artifact named ${NAME} on crt-platform/${SERVICE}."
+            echo "::error::Artifacts expire after 90 days; a build with no feat/fix commits is named main-<7-char sha>."
+            exit 1
+          fi
+          echo "artifact id: $ID"
+          gh api "repos/crt-platform/${SERVICE}/actions/artifacts/${ID}/zip" > artifact.zip
+          unzip -o -q artifact.zip
+          test -f dist.gz || { echo "::error::artifact did not contain dist.gz"; exit 1; }
+          echo "ARTIFACT_PATH=$PWD/dist.gz" >> "$GITHUB_ENV"
+
+      - name: Install the deploy key
+        env:
+          DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY_CRT_DEV }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEPLOY_KEY}" ]; then
+            echo "::error::SSH_DEPLOY_KEY_CRT_DEV is empty. An org secret must grant access to THIS repo."
+            exit 1
+          fi
+          install -d -m 700 "$RUNNER_TEMP/.ssh"
+          # printf guarantees the trailing newline OpenSSH requires; a pasted
+          # secret missing it fails with a misleading 'error in libcrypto'.
+          printf '%s\n' "${DEPLOY_KEY}" > "$RUNNER_TEMP/.ssh/deploy_key"
+          chmod 600 "$RUNNER_TEMP/.ssh/deploy_key"
+          echo "SSH_KEY_PATH=$RUNNER_TEMP/.ssh/deploy_key" >> "$GITHUB_ENV"
+
+      - name: Run
+        env:
+          SSH_KEY_PATH: ${{ env.SSH_KEY_PATH }}
+        run: |
+          python3 microservice-deploy/deploy.py \
+            --service   "${{ inputs.service }}" \
+            --version   "${{ inputs.version }}" \
+            --environment "${{ inputs.environment }}" \
+            --mode      "${{ inputs.mode }}" \
+            --hosts     "${{ inputs.hosts }}" \
+            --ms-deploy .ms-deploy \
+            --artifact  "${ARTIFACT_PATH:-}" \
+            ${{ inputs.force_npm_ci && '--force-npm-ci' || '' }} \
+            ${{ inputs.clear_cache && '--clear-cache' || '' }}
+
+      - name: Remove the deploy key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/.ssh/deploy_key"
