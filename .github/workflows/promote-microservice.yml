@@ -196,7 +196,7 @@ jobs:
             echo "::warning::PR base '$BASE' does not exist — the destination branch was pushed, no PR opened"
             exit 0
           fi
-          BODY=$(printf 'Promoted from `%s/%s:%s` @ `%s`.\n\nPipeline transformed by `microservice-pipeline/migrate.py` in legacy-workflows@%s:\n\n```\n%s\n```\n\nMerging this fires `release.yml` and produces the `x.y.z-dev.N` artifact Heimdall deploys.' \
+          BODY=$(printf 'Promoted from `%s/%s:%s` @ `%s`.\n\nPipeline transformed by `microservice-pipeline/migrate.py` in legacy-workflows@%s:\n\n```\n%s\n```\n\nMerging this fires `release.yml` and produces the `x.y.z-dev.N` artifact the deploy step consumes (the **Deploy microservice** workflow for enrolled services, Heimdall otherwise).' \
             "$UPSTREAM_ORG" "${{ steps.v.outputs.repo }}" "${{ steps.v.outputs.src }}" "$UPSTREAM_SHA" "${{ github.sha }}" "$(cat "$RUNNER_TEMP/migrate.log")")
           PAYLOAD=$(python3 -c 'import json,os,sys; print(json.dumps({"title":sys.argv[1],"head":sys.argv[2],"base":sys.argv[3],"body":sys.argv[4]}))' \
             "ci: promote ${{ steps.v.outputs.src }} from ndcmsl" \
@@ -232,7 +232,10 @@ jobs:
             echo "1. \`release.yml\` cuts \`x.y.z-dev.N\` and uploads artifact \`main-<version>\`."
             echo "2. Config must be on ms-deploy **\`main\`**: \`${{ steps.v.outputs.repo }}/prod/crt_dev/app.settings.js\` (Heimdall fetches the DEFAULT branch, never \`dev\`)."
             echo "3. Secret \`heimdall/${{ steps.v.outputs.repo }}/prod\` must exist."
-            echo "4. Deploy from Heimdall (mode PROD, infrastructure CRT_DEV), then re-apply any hot-patches."
+            echo "4. Deploy it — **which path depends on whether the service is enrolled**:"
+            echo "   - ms-deploy has \`${{ steps.v.outputs.repo }}/deploy/crt_dev.yaml\` -> run the **Deploy microservice** workflow in legacy-workflows (Actions -> Run workflow), \`mode: deploy\`. Paste the version from step 1; for a build with no new version that is the 7-char **sha**."
+            echo "   - otherwise -> Heimdall (mode PROD, infrastructure CRT_DEV), as before."
+            echo "5. Re-apply any hot-patches — a deploy overwrites them either way."
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Notify Slack
