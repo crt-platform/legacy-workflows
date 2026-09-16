@@ -116,10 +116,29 @@ def checkout(box, version):
 
 
 def unpack_artifact(box, local_dist_gz):
-    box.run(f"mkdir -p {shlex.quote(box.root)}/artifacts/{box.service}", cwd=False)
+    """Snapshot the current dist/ before overwriting it.
+
+    Rollback CANNOT rely on `git checkout <previous>`: dist/ is build output and
+    is not tracked by git, so a checkout alone leaves the new, broken bundle in
+    place and pm2 reloads exactly the code that just failed. Keeping the previous
+    dist on the box also makes rollback independent of GitHub's 90-day artifact
+    retention.
+    """
+    box.run(f"mkdir -p {shlex.quote(box.root)}/artifacts/{box.service} {STATE_DIR}", cwd=False)
+    box.run(f"if [ -d dist ]; then rm -rf {STATE_DIR}/{box.service}.dist.prev && "
+            f"cp -a dist {STATE_DIR}/{box.service}.dist.prev; fi")
     remote = f"{box.root}/artifacts/{box.service}/dist.gz"
     box.push(local_dist_gz, remote)
     box.run(f"tar -xzf {shlex.quote(remote)}")
+
+
+def restore_previous_dist(box):
+    snap = f"{STATE_DIR}/{box.service}.dist.prev"
+    present = box.run(f"[ -d {snap} ] && echo YES || echo NO", cwd=False, check=False)
+    if "YES" not in present:
+        raise Fail(f"[{box.name}] no previous dist snapshot at {snap} — cannot roll back the build output")
+    box.run(f"rm -rf dist && cp -a {snap} dist")
+    return "restored previous dist"
 
 
 def render_config(box, cfg_dir_local, secret_id, region, renderer_local):
@@ -252,6 +271,7 @@ def deploy_host(box, cfg, env, args, paths):
                        f"version to fall back to (recorded: {previous or 'none'})")
         log(f"  rolling back to {previous}")
         checkout(box, previous)
+        log("  " + restore_previous_dist(box))
         npm_install(box, force=True)
         results.append(reload_and_verify(box, cfg, env.get("health_settle_seconds", 20)))
         raise Fail(f"[{box.name}] deploy of {args.version} failed health; rolled back to {previous}")
