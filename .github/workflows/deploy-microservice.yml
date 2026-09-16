@@ -88,8 +88,17 @@ jobs:
         run: |
           set -euo pipefail
           NAME="main-${VERSION}"
-          ID=$(gh api "repos/crt-platform/${SERVICE}/actions/artifacts?name=${NAME}" \
-                 --jq '.artifacts[0].id // empty')
+          # A /ryan force-push can prune and re-cut the same x.y.z-dev.N over
+          # DIFFERENT code, so two artifacts can share this name for up to 90
+          # days. API order is not guaranteed: take the newest non-expired one.
+          ALL=$(gh api "repos/crt-platform/${SERVICE}/actions/artifacts?name=${NAME}&per_page=100")
+          COUNT=$(echo "$ALL" | jq '[.artifacts[] | select(.expired == false)] | length')
+          if [ "${COUNT:-0}" -gt 1 ]; then
+            echo "::warning::${COUNT} live artifacts are named ${NAME} — the version number was reused. Deploying the newest; verify the id below is the build you meant."
+            echo "$ALL" | jq -r '.artifacts[] | select(.expired == false) | "  id=\(.id) created=\(.created_at)"'
+          fi
+          ID=$(echo "$ALL" | jq -r '[.artifacts[] | select(.expired == false)]
+                 | sort_by(.created_at) | last | .id // empty')
           if [ -z "$ID" ]; then
             echo "::error::no artifact named ${NAME} on crt-platform/${SERVICE}."
             echo "::error::Artifacts expire after 90 days; a build with no feat/fix commits is named main-<7-char sha>."
