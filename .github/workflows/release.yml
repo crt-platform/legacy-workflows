@@ -24,6 +24,21 @@ on:
         required: false
         default: 'main'
         type: string
+      deploy:
+        description: 'Hand the build to deploy-microservice.yml. Harmless when the service is not enrolled: that workflow exits 0 with NOT_ENROLLED unless ms-deploy carries <service>/deploy/<env>.yaml.'
+        required: false
+        default: true
+        type: boolean
+      deploy-branch:
+        description: 'Only auto-deploy pushes to this branch. create-dev tracks dev; master/main have no unattended target yet.'
+        required: false
+        default: 'dev'
+        type: string
+      deploy-environment:
+        description: 'Environment key in ms-deploy/deploy/environments.yaml.'
+        required: false
+        default: 'crt_dev'
+        type: string
 
 concurrency:
   group: release-${{ github.repository }}-${{ github.ref_name }}
@@ -367,4 +382,66 @@ jobs:
             echo "::warning::403/404 usually means GH_TOKEN lacks workflow (actions:write)"
             echo "::warning::scope on crt-platform/legacy-workflows, or notify-release.yml"
             echo "::warning::does not exist on ref '$NOTIFIER_REF'."
+          fi
+
+  # Hands the freshly built artifact to deploy-microservice.yml in
+  # legacy-workflows, which SSHes into the create-dev boxes. Dispatched rather
+  # than called for the same reason as `notify`: the deploy key is an org secret
+  # that a reusable workflow cannot read.
+  #
+  # Rollout is gated by DATA, never by this file. deploy-microservice.yml exits
+  # 0 with NOT_ENROLLED unless ms-deploy carries <service>/deploy/<env>.yaml, so
+  # enabling this for every caller deploys only the services that opted in.
+  #
+  # Its own job, after `release` succeeded: there is no artifact otherwise. A
+  # failed dispatch turns THIS job red while the release stays green — silence
+  # here is exactly how a build sits undeployed and nobody notices.
+  deploy:
+    name: Deploy to create-dev
+    needs: [release]
+    if: >-
+      ${{ inputs.deploy
+          && inputs.is-microservice
+          && needs.release.result == 'success'
+          && github.ref_name == inputs.deploy-branch }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch the deploy
+        env:
+          GH_TOKEN: ${{ secrets.token }}
+          SERVICE: ${{ github.event.repository.name }}
+          VERSION: ${{ needs.release.outputs.version }}
+          ENVIRONMENT: ${{ inputs.deploy-environment }}
+        run: |
+          set -euo pipefail
+          if [ -z "${VERSION}" ]; then
+            echo "::error::release produced no version to deploy"; exit 1
+          fi
+          # `version` is a tag OR a 7-char sha when no new version was cut;
+          # deploy-microservice.yml resolves artifact main-<version> either way.
+          cat > /tmp/deploy.json <<JSON
+          {"ref":"main","inputs":{
+            "service":"${SERVICE}","version":"${VERSION}","mode":"deploy",
+            "environment":"${ENVIRONMENT}","ms_deploy_ref":"main"}}
+          JSON
+          CODE=$(curl -s -o /tmp/resp.txt -w '%{http_code}' -m 20 -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/crt-platform/legacy-workflows/actions/workflows/deploy-microservice.yml/dispatches" \
+            --data @/tmp/deploy.json) || CODE=000
+          if [ "$CODE" = "204" ]; then
+            echo "deploy dispatched: ${SERVICE} ${VERSION} -> ${ENVIRONMENT}"
+            {
+              echo "### Deploy dispatched"
+              echo ""
+              echo "\`${SERVICE}\` **${VERSION}** -> \`${ENVIRONMENT}\`"
+              echo ""
+              echo "[Deploy microservice runs](https://github.com/crt-platform/legacy-workflows/actions/workflows/deploy-microservice.yml) — a service with no \`deploy/${ENVIRONMENT}.yaml\` in ms-deploy exits as NOT_ENROLLED."
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::error::could not dispatch the deploy (HTTP $CODE) — the artifact is built but NOTHING will deploy it."
+            echo "::error::$(head -c 300 /tmp/resp.txt | tr -d '\n')"
+            echo "::error::403/404 usually means GH_TOKEN lacks workflow (actions:write) on crt-platform/legacy-workflows."
+            exit 1
           fi
