@@ -88,25 +88,50 @@ jobs:
         run: |
           set -euo pipefail
           NAME="main-${VERSION}"
+          API="https://api.github.com/repos/crt-platform/${SERVICE}/actions/artifacts"
+
+          # curl + python3 only: the self-hosted `ms` runner has neither `gh`
+          # nor `unzip` (GitHub-hosted images do, which is what this originally
+          # assumed). python3 is present and its stdlib covers both jobs.
+          curl -sSf -H "Authorization: Bearer ${GH_TOKEN}" \
+               -H "Accept: application/vnd.github+json" \
+               "${API}?name=${NAME}&per_page=100" -o artifacts.json
+
           # A /ryan force-push can prune and re-cut the same x.y.z-dev.N over
           # DIFFERENT code, so two artifacts can share this name for up to 90
           # days. API order is not guaranteed: take the newest non-expired one.
-          ALL=$(gh api "repos/crt-platform/${SERVICE}/actions/artifacts?name=${NAME}&per_page=100")
-          COUNT=$(echo "$ALL" | jq '[.artifacts[] | select(.expired == false)] | length')
-          if [ "${COUNT:-0}" -gt 1 ]; then
-            echo "::warning::${COUNT} live artifacts are named ${NAME} — the version number was reused. Deploying the newest; verify the id below is the build you meant."
-            echo "$ALL" | jq -r '.artifacts[] | select(.expired == false) | "  id=\(.id) created=\(.created_at)"'
-          fi
-          ID=$(echo "$ALL" | jq -r '[.artifacts[] | select(.expired == false)]
-                 | sort_by(.created_at) | last | .id // empty')
+          ID=$(python3 - <<'PY'
+          import json
+          live = [a for a in json.load(open('artifacts.json')).get('artifacts', []) if not a['expired']]
+          live.sort(key=lambda a: a['created_at'])
+          if len(live) > 1:
+              print(f"::warning::{len(live)} live artifacts share this name — the version number was reused. "
+                    "Deploying the newest; check the id below is the build you meant.")
+              for a in live:
+                  print(f"  id={a['id']} created={a['created_at']}")
+          print(f"ARTIFACT_ID={live[-1]['id']}" if live else "ARTIFACT_ID=")
+          PY
+          )
+          echo "$ID" | grep -v '^ARTIFACT_ID=' || true          # surface warnings
+          ID=$(echo "$ID" | sed -n 's/^ARTIFACT_ID=//p')
           if [ -z "$ID" ]; then
-            echo "::error::no artifact named ${NAME} on crt-platform/${SERVICE}."
+            echo "::error::no live artifact named ${NAME} on crt-platform/${SERVICE}."
             echo "::error::Artifacts expire after 90 days; a build with no feat/fix commits is named main-<7-char sha>."
             exit 1
           fi
           echo "artifact id: $ID"
-          gh api "repos/crt-platform/${SERVICE}/actions/artifacts/${ID}/zip" > artifact.zip
-          unzip -o -q artifact.zip
+
+          # The API answers 302 to a presigned URL. Fetch the redirect target
+          # first and download it unauthenticated: S3 rejects a request that
+          # carries both its presigned query and an Authorization header.
+          LOC=$(curl -sS -o /dev/null -w '%{redirect_url}' \
+                  -H "Authorization: Bearer ${GH_TOKEN}" \
+                  -H "Accept: application/vnd.github+json" \
+                  "${API}/${ID}/zip")
+          [ -n "$LOC" ] || { echo "::error::no download URL for artifact ${ID}"; exit 1; }
+          curl -sSf -o artifact.zip "$LOC"
+
+          python3 -c "import zipfile; zipfile.ZipFile('artifact.zip').extractall()"
           test -f dist.gz || { echo "::error::artifact did not contain dist.gz"; exit 1; }
           echo "ARTIFACT_PATH=$PWD/dist.gz" >> "$GITHUB_ENV"
 
