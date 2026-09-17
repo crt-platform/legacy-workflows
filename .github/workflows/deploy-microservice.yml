@@ -134,6 +134,7 @@ jobs:
           python3 -c "import zipfile; zipfile.ZipFile('artifact.zip').extractall()"
           test -f dist.gz || { echo "::error::artifact did not contain dist.gz"; exit 1; }
           echo "ARTIFACT_PATH=$PWD/dist.gz" >> "$GITHUB_ENV"
+          echo "ARTIFACT_ID=$ID" >> "$GITHUB_ENV"        # reported in the Slack message
 
       - name: Install the deploy key
         env:
@@ -169,3 +170,61 @@ jobs:
       - name: Remove the deploy key
         if: always()
         run: rm -f "$RUNNER_TEMP/.ssh/deploy_key"
+
+      # Posted from here rather than via notify-release.yml: this workflow is
+      # DISPATCHED into legacy-workflows, so it can read the org webhook secret
+      # directly. One less hop, one less run in the Actions list, and no silent
+      # dispatch failure between a finished deploy and the message about it.
+      #
+      # Only `deploy` mode is announced: plan and stage change nothing a channel
+      # needs to hear about.
+      - name: Notify Slack
+        if: ${{ always() && inputs.mode == 'deploy' }}
+        env:
+          HOOK: ${{ secrets.SLACK_WEBHOOK_URL_DEV_RELEASES }}
+          STATUS: ${{ job.status }}
+          SERVICE: ${{ inputs.service }}
+          VERSION: ${{ inputs.version }}
+          ENVIRONMENT: ${{ inputs.environment }}
+          HOSTS: ${{ inputs.hosts }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          if [ -z "${HOOK}" ]; then
+            echo "::warning::no SLACK_WEBHOOK_URL_DEV_RELEASES — nothing posted"
+            exit 0
+          fi
+          echo "::add-mask::$HOOK"
+          # json.dumps, not interpolation: service and actor are free text.
+          python3 - > /tmp/slack.json <<'PY'
+          import json, os
+          e = os.environ
+          svc, ver = e["SERVICE"], e["VERSION"]
+          env_name = e["ENVIRONMENT"]
+          art = e.get("ARTIFACT_ID") or ""
+          hosts = e.get("HOSTS") or "(from config)"
+          who = f" · by {e['ACTOR']}" if e.get("ACTOR") else ""
+          link = f"<{e['RUN_URL']}|Deploy run>"
+
+          if e["STATUS"] == "success":
+              lines = [
+                  f"✅ *{svc}* — *deployed* `{ver}` to `{env_name}`",
+                  f"*artifact* `main-{ver}`" + (f"  (id `{art}`)" if art else ""),
+                  f"*hosts* {hosts}{who}",
+              ]
+          else:
+              # A deploy is sequential across hosts and rolls back only on a failed
+              # health gate. Anything earlier leaves the fleet untouched, so say
+              # "check the run" rather than guessing which half happened.
+              lines = [
+                  f"❌ *{svc}* — *DEPLOY FAILED* for `{ver}` on `{env_name}` ({e['STATUS']}){who}",
+                  f"*artifact* `main-{ver}`" + (f"  (id `{art}`)" if art else ""),
+                  "The run log names the host it stopped on and whether it rolled back.",
+              ]
+          lines.append(link)
+          print(json.dumps({"text": "\n".join(lines)}))
+          PY
+          curl -sS -m 15 -X POST -H 'Content-Type: application/json' \
+            --data @/tmp/slack.json "$HOOK" >/dev/null \
+            || echo "::warning::could not post the deploy result to Slack"

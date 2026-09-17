@@ -315,12 +315,21 @@ jobs:
   # starts still reports -- a step can only speak for a job that ran.
   notify:
     name: Notify Slack
-    needs: [detect-release-scope, release]
+    needs: [detect-release-scope, release, deploy]
     # Report on success and on failure, but stay quiet on a deliberate skip
     # (a package_src-only push, or [skip ci]) -- that is not news. A FAILED
     # detect-release-scope also skips `release`, and that IS news, hence the
     # two-part condition.
-    if: ${{ always() && inputs.notify && (needs.detect-release-scope.result != 'success' || needs.release.result != 'skipped') }}
+    #
+    # ...and stay quiet when a deploy was dispatched: deploy-microservice.yml
+    # posts the result itself, and "build ready to deploy" arriving seconds
+    # before "deployed" is noise that reads like two separate events. If the
+    # DISPATCH failed, this fires -- otherwise a build nothing will deploy would
+    # pass in silence.
+    if: >-
+      ${{ always() && inputs.notify
+          && (needs.detect-release-scope.result != 'success' || needs.release.result != 'skipped')
+          && needs.deploy.result != 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Dispatch the Slack notification
