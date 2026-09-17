@@ -92,6 +92,13 @@ def pm2_process(box):
 
 
 def health(box, cfg):
+    """HTTP status as a string, or None when the service declares no health block.
+
+    `health` is optional: erp.logistic and erp.quartup answer on no path we could
+    find, and a service whose gate can never pass is worse than a weaker gate.
+    """
+    if not cfg.get("health"):
+        return None
     url = f"http://127.0.0.1:{cfg['health']['port']}{cfg['health']['path']}"
     code = box.run(f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 10 {shlex.quote(url)}",
                    cwd=False, check=False)
@@ -191,7 +198,7 @@ def reload_and_verify(box, cfg, settle):
     log(f"  settling {settle}s before judging health")
     time.sleep(settle)
 
-    code = health(box, cfg)
+    code = health(box, cfg)                       # None when the service declares no health block
     proc = pm2_process(box)
     if proc is None:
         raise Fail(f"[{box.name}] {box.service} is not in pm2 after reload")
@@ -203,6 +210,12 @@ def reload_and_verify(box, cfg, settle):
     # a restart counter that keeps moving is.
     if r2 != r1:
         raise Fail(f"[{box.name}] restart counter still climbing ({baseline} -> {r1} -> {r2}): crash loop")
+    if code is None:
+        # No health block: the restart-counter check still catches a crash loop,
+        # but nothing here proves the service can actually answer. A process that
+        # boots, stays up and serves errors passes this gate.
+        box.run("pm2 save", cwd=False)
+        return f"restarts stable at {r2} (NO health check — service declares none)"
     if code != "200":
         raise Fail(f"[{box.name}] health {cfg['health']['path']} returned {code}, expected 200")
     box.run("pm2 save", cwd=False)
@@ -229,7 +242,7 @@ def deploy_host(box, cfg, env, args, paths):
         raise Fail(f"[{box.name}] {box.service} has no pm2 process here — wrong `hosts` in "
                    f"{box.service}/deploy/{args.environment}.yaml? (a settings file is not proof)")
     log(f"  pm2: status={proc['pm2_env']['status']} restarts={proc['pm2_env']['restart_time']}")
-    log(f"  health now: {health(box, cfg)}")
+    log(f"  health now: {health(box, cfg) or 'n/a (no health block)'}")
     log(f"  last-good: {last_good(box) or '(none recorded)'}")
 
     if args.mode == "plan":
@@ -238,9 +251,10 @@ def deploy_host(box, cfg, env, args, paths):
                      f"--region {env['region']} --query Name --output text 2>&1 | tail -1",
                      cwd=False, check=False)
         log(f"  secret readable as {box.user}: {ok}")
+        gate = cfg["health"]["path"] if cfg.get("health") else "restart counter only (no health block)"
         log(f"  WOULD: checkout {args.version}, unpack artifact, render "
             f"{len(os.listdir(paths['config_dir']))} config file(s), npm ci if lock changed, "
-            f"pm2 reload, verify {cfg['health']['path']}")
+            f"pm2 reload, verify {gate}")
         return ["plan only"]
 
     results.append(ensure_clone(box, env["artifact_owner"]))
@@ -309,9 +323,17 @@ def main():
         return 0
     with open(svc_file) as fh:
         cfg = yaml.safe_load(fh)
-    for field in ("hosts", "health"):
-        if field not in cfg:
-            raise Fail(f"{svc_file} is missing required key '{field}'")
+    if "hosts" not in cfg:
+        raise Fail(f"{svc_file} is missing required key 'hosts'")
+    if cfg.get("health") and not (cfg["health"].get("port") and cfg["health"].get("path")):
+        raise Fail(f"{svc_file} has a health block without both 'port' and 'path'")
+
+    # `enabled: false` keeps a service's config ready without ever deploying it.
+    # The sqlserver ETLs are the case: deliberately stopped in dev, and a
+    # `pm2 reload` of the ecosystem file would START them again.
+    if cfg.get("enabled", True) is False:
+        log(f"DISABLED: {args.service} has enabled:false in deploy/{args.environment}.yaml — skipping")
+        return 0
 
     host_names = [h.strip() for h in args.hosts.split(",") if h.strip()] or cfg["hosts"]
     unknown = [h for h in host_names if h not in env["hosts"]]
