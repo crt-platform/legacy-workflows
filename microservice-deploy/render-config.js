@@ -7,14 +7,21 @@
  * /deployment/<service>/.
  *
  * Deliberately identical to Heimdall's behaviour
- * (deployment-execute-deploy.service.ts:505-545):
- *   - only files matching /^app.*\.settings\.js$/ are templated; everything
- *     else is copied byte for byte, so a {{...}} in ecosystem.config.js lands
- *     literally, exactly as it does today
+ * (deployment-execute-deploy.service.ts:505-545), with ONE deliberate
+ * divergence, marked below:
  *   - unresolved placeholders SURVIVE (heimdall/ecom.catalog/prod has 6 keys
  *     for 8 placeholders and the live box genuinely contains '{{sqlServer...}}')
  *   - substitution is textual, before any parsing
  *   - files are staged then moved, and nothing is ever deleted
+ *
+ * DIVERGENCE FROM HEIMDALL: `appsettings*.json` is templated too.
+ * Heimdall templates only /^app.*\.settings\.js$/, so `appsettings.production.json`
+ * — which does NOT match — would be copied byte for byte and any {{placeholder}}
+ * in it would land literally, breaking the service. That file is the 4th config
+ * layer (`appsettings.${MODE}.json` beats app.settings.js), it carries real
+ * credentials, and it is NOT in the service repo or the build artifact: on
+ * ms-jobs it was hand-made and is gitignored. Templating it is what lets
+ * ms-deploy own it the way it owns jobs.json.
  *
  * Secret VALUES are never printed — only key names and counts.
  *
@@ -31,7 +38,9 @@ if (!secretId || !region || !tmpDir || !destDir) {
   process.exit(2);
 }
 
-const SETTINGS = /^app.*\.settings\.js$/;
+const SETTINGS = /^app.*\.settings\.js$/;           // Heimdall's own rule
+const APPSETTINGS = /^appsettings.*\.json$/;        // the divergence (see header)
+const isTemplated = (name) => SETTINGS.test(name) || APPSETTINGS.test(name);
 
 let secret = {};
 try {
@@ -64,12 +73,20 @@ for (const name of files) {
   const src = path.join(tmpDir, name);
   if (!fs.statSync(src).isFile()) continue;
 
-  if (SETTINGS.test(name)) {
+  if (isTemplated(name)) {
     let text = fs.readFileSync(src, 'utf8');
     for (const [key, value] of Object.entries(secret)) {
       text = text.split(`{{${key}}}`).join(String(value));
     }
     for (const m of text.matchAll(/\{\{([^}]+)\}\}/g)) unresolved.add(m[1]);
+    // An appsettings*.json left holding a placeholder is not a survivable state
+    // the way a settings.js one is: it is parsed as JSON at boot and the value
+    // would be used as a literal credential. Fail here instead of on the box.
+    if (APPSETTINGS.test(name) && /\{\{[^}]+\}\}/.test(text)) {
+      console.error(`FATAL: ${name} still holds unresolved placeholders after substitution.`);
+      console.error('Add the missing keys to the service secret before deploying.');
+      process.exit(1);
+    }
     fs.writeFileSync(src, text, { mode: 0o600 });
     templated += 1;
   } else {
