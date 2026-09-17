@@ -80,26 +80,48 @@ class Box:
         )
 
 
-def pm2_process(box):
+def pm2_apps(box, cfg):
+    """The pm2 processes this deployment directory owns.
+
+    Usually one, named after the service. `erp.wms` is the exception: a single
+    /deployment/erp.wms with ONE dist/ and three processes told apart by an
+    APP_KEY env (SKL/THM/CRT), each reading its own app_<KEY>.settings.js.
+    They cannot be deployed separately — replacing dist/ replaces the code all
+    three run — so they are reloaded and verified together. Reloading only one
+    would leave the others running old code from memory over a new dist, to be
+    picked up untested at the next restart.
+    """
+    return list(cfg.get("pm2_apps") or [box.service])
+
+
+def pm2_process(box, name=None):
     raw = box.run("pm2 jlist 2>/dev/null", cwd=False)
     start = raw.find("[")
     if start < 0:
         raise Fail(f"[{box.name}] pm2 jlist returned no JSON")
+    want = name or box.service
     for proc in json.loads(raw[start:]):
-        if proc.get("name") == box.service:
+        if proc.get("name") == want:
             return proc
     return None
 
 
-def health(box, cfg):
-    """HTTP status as a string, or None when the service declares no health block.
+def health_port(cfg, app):
+    """`port` for a single-process service, or `ports: {app: port}` for several."""
+    h = cfg.get("health") or {}
+    return h["ports"].get(app) if "ports" in h else h.get("port")
+
+
+def health(box, cfg, app=None):
+    """HTTP status as a string, or None when this app has no health endpoint.
 
     `health` is optional: erp.logistic and erp.quartup answer on no path we could
     find, and a service whose gate can never pass is worse than a weaker gate.
     """
-    if not cfg.get("health"):
+    port = health_port(cfg, app or box.service)
+    if not cfg.get("health") or not port:
         return None
-    url = f"http://127.0.0.1:{cfg['health']['port']}{cfg['health']['path']}"
+    url = f"http://127.0.0.1:{port}{cfg['health']['path']}"
     code = box.run(f"curl -s -o /dev/null -w '%{{http_code}}' --max-time 10 {shlex.quote(url)}",
                    cwd=False, check=False)
     return code.strip()[-3:]
@@ -190,36 +212,55 @@ def npm_install(box, force):
 
 
 def reload_and_verify(box, cfg, settle):
-    before = pm2_process(box)
-    baseline = before["pm2_env"]["restart_time"] if before else 0
-    box.run(f"pm2 flush {shlex.quote(box.service)} && "
-            f"pm2 reload {shlex.quote(box.cwd)}/ecosystem.config.js --time && pm2 reset all",
+    """Reload the ecosystem file, then verify EVERY pm2 app it owns.
+
+    `pm2 reload ecosystem.config.js` already restarts every app declared there,
+    so a multi-process service is reloaded as a unit whether we like it or not —
+    the gate therefore has to judge all of them. One unhealthy vertical fails the
+    deploy for all three, which is correct: they share a dist/.
+    """
+    apps = pm2_apps(box, cfg)
+    baseline = {}
+    for app in apps:
+        proc = pm2_process(box, app)
+        baseline[app] = proc["pm2_env"]["restart_time"] if proc else 0
+
+    box.run(" && ".join(f"pm2 flush {shlex.quote(a)}" for a in apps) +
+            f" && pm2 reload {shlex.quote(box.cwd)}/ecosystem.config.js --time && pm2 reset all",
             cwd=False)
     log(f"  settling {settle}s before judging health")
     time.sleep(settle)
 
-    code = health(box, cfg)                       # None when the service declares no health block
-    proc = pm2_process(box)
-    if proc is None:
-        raise Fail(f"[{box.name}] {box.service} is not in pm2 after reload")
-    r1 = proc["pm2_env"]["restart_time"]
+    first = {}
+    for app in apps:
+        proc = pm2_process(box, app)
+        if proc is None:
+            raise Fail(f"[{box.name}] {app} is not in pm2 after reload")
+        first[app] = proc["pm2_env"]["restart_time"]
+    codes = {app: health(box, cfg, app) for app in apps}   # None = no endpoint declared
     time.sleep(5)
-    r2 = pm2_process(box)["pm2_env"]["restart_time"]
 
-    # pm2 reports a crash-looping process as `online`, so status is never the test:
-    # a restart counter that keeps moving is.
-    if r2 != r1:
-        raise Fail(f"[{box.name}] restart counter still climbing ({baseline} -> {r1} -> {r2}): crash loop")
-    if code is None:
-        # No health block: the restart-counter check still catches a crash loop,
-        # but nothing here proves the service can actually answer. A process that
-        # boots, stays up and serves errors passes this gate.
-        box.run("pm2 save", cwd=False)
-        return f"restarts stable at {r2} (NO health check — service declares none)"
-    if code != "200":
-        raise Fail(f"[{box.name}] health {cfg['health']['path']} returned {code}, expected 200")
+    notes = []
+    for app in apps:
+        # pm2 reports a crash-looping process as `online`, so status is never the
+        # test: a restart counter that keeps moving is.
+        second = pm2_process(box, app)["pm2_env"]["restart_time"]
+        if second != first[app]:
+            raise Fail(f"[{box.name}] {app}: restart counter still climbing "
+                       f"({baseline[app]} -> {first[app]} -> {second}): crash loop")
+        code = codes[app]
+        if code is None:
+            # The restart check still catches a crash loop, but nothing here proves
+            # the app can answer: one that boots and serves errors passes.
+            notes.append(f"{app} restarts stable at {second} (NO health check)")
+        elif code != "200":
+            raise Fail(f"[{box.name}] {app}: health {cfg['health']['path']} "
+                       f"(port {health_port(cfg, app)}) returned {code}, expected 200")
+        else:
+            notes.append(f"{app} health 200, restarts stable at {second}")
+
     box.run("pm2 save", cwd=False)
-    return f"health 200, restarts stable at {r2}"
+    return "; ".join(notes)
 
 
 def last_good(box):
@@ -237,12 +278,16 @@ def deploy_host(box, cfg, env, args, paths):
     results = []
     log(f"\n=== {box.name} ({box.ip})")
 
-    proc = pm2_process(box)
-    if proc is None:
-        raise Fail(f"[{box.name}] {box.service} has no pm2 process here — wrong `hosts` in "
-                   f"{box.service}/deploy/{args.environment}.yaml? (a settings file is not proof)")
-    log(f"  pm2: status={proc['pm2_env']['status']} restarts={proc['pm2_env']['restart_time']}")
-    log(f"  health now: {health(box, cfg) or 'n/a (no health block)'}")
+    apps = pm2_apps(box, cfg)
+    for app in apps:
+        proc = pm2_process(box, app)
+        if proc is None:
+            raise Fail(f"[{box.name}] {app} has no pm2 process here — wrong `hosts` or "
+                       f"`pm2_apps` in {box.service}/deploy/{args.environment}.yaml? "
+                       f"(a settings file is not proof of deployment)")
+        log(f"  pm2 {app}: status={proc['pm2_env']['status']} "
+            f"restarts={proc['pm2_env']['restart_time']} "
+            f"health={health(box, cfg, app) or 'n/a'}")
     log(f"  last-good: {last_good(box) or '(none recorded)'}")
 
     if args.mode == "plan":
@@ -251,10 +296,11 @@ def deploy_host(box, cfg, env, args, paths):
                      f"--region {env['region']} --query Name --output text 2>&1 | tail -1",
                      cwd=False, check=False)
         log(f"  secret readable as {box.user}: {ok}")
-        gate = cfg["health"]["path"] if cfg.get("health") else "restart counter only (no health block)"
+        gate = (f"{cfg['health']['path']} on {', '.join(f'{a}:{health_port(cfg, a)}' for a in apps)}"
+                if cfg.get("health") else "restart counter only (no health block)")
         log(f"  WOULD: checkout {args.version}, unpack artifact, render "
             f"{len(os.listdir(paths['config_dir']))} config file(s), npm ci if lock changed, "
-            f"pm2 reload, verify {gate}")
+            f"pm2 reload {len(apps)} app(s), verify {gate}")
         return ["plan only"]
 
     results.append(ensure_clone(box, env["artifact_owner"]))
@@ -325,8 +371,16 @@ def main():
         cfg = yaml.safe_load(fh)
     if "hosts" not in cfg:
         raise Fail(f"{svc_file} is missing required key 'hosts'")
-    if cfg.get("health") and not (cfg["health"].get("port") and cfg["health"].get("path")):
-        raise Fail(f"{svc_file} has a health block without both 'port' and 'path'")
+    if cfg.get("health"):
+        h = cfg["health"]
+        if not h.get("path"):
+            raise Fail(f"{svc_file} has a health block without 'path'")
+        if not h.get("port") and not h.get("ports"):
+            raise Fail(f"{svc_file} health needs 'port', or 'ports' mapping each pm2 app to one")
+        if h.get("ports"):
+            missing = [a for a in (cfg.get("pm2_apps") or [args.service]) if a not in h["ports"]]
+            if missing:
+                raise Fail(f"{svc_file} health.ports is missing {missing} — every pm2 app needs a port")
 
     # `enabled: false` keeps a service's config ready without ever deploying it.
     # The sqlserver ETLs are the case: deliberately stopped in dev, and a
